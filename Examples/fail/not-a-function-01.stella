@@ -1,0 +1,9 @@
+language core;
+
+fn go(a : Nat, b : Nat) -> Nat {
+  return a(b)
+}
+
+fn main(n : Nat) -> Nat {
+  return go(n, 0)
+}

@@ -1,0 +1,3 @@
+[submodule "Oleg_testsuite"]
+	path = Oleg_testsuite
+	url = https://github.com/ThatDraenGuy/stella_test_suite/

@@ -1,0 +1,5 @@
+language core;
+
+fn main() -> Nat {
+    return {[], 1}.1 
+}

@@ -1,0 +1,9 @@
+language core;
+
+fn id(n : Nat) -> Nat {
+    return n;
+}
+
+fn main(n : Nat) -> Nat {
+  return id(fn(x : Nat) { return x })
+}

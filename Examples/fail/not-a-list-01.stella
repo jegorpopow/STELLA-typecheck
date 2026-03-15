@@ -1,0 +1,9 @@
+language core;
+
+fn produce_tuple(n : Nat) -> {} {
+    return {}
+}
+
+fn main(n : Nat) -> Nat {
+    return List::isempty(produce_tuple(n))
+}

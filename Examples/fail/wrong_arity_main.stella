@@ -1,0 +1,5 @@
+language core;
+
+fn main(n : Nat, m : Nat ) -> {Nat, Nat} {
+   return {n, m}
+} 

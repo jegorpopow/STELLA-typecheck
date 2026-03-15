@@ -1,0 +1,5 @@
+language core;
+
+fn main(n : Nat) -> Nat {
+    return { current = n, next = succ(n) }.1;
+}

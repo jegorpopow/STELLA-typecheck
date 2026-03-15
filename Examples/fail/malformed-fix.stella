@@ -1,0 +1,9 @@
+language core;
+
+fn step(n : Nat) -> Bool {
+    return Nat::iszero(n);
+}
+
+fn main(n : Nat) -> Nat {
+  return fix(step);
+}

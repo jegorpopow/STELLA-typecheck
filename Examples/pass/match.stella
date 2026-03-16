@@ -1,0 +1,23 @@
+language core;
+
+extend with #sum-types, #type-ascriptions, #natural-literals;
+
+fn match_sum(sum : Nat + Bool) -> Nat {
+    return 
+      match sum {
+          inl(n) => n
+        | inr(b) => 0
+      }
+}
+
+fn match_variant(var : <| a : Nat, b : Bool, d|>) -> Nat {
+    return match var {
+        <| a = k |> => k
+      | <| b = c |> => if c then 5 else 7 
+      | <| d |> => 0
+    }
+}
+
+fn main(n : Nat) -> Nat {
+    return match_sum(inl(5) as (Nat + Bool))
+}

@@ -113,6 +113,7 @@ data TypeCheckerError
   | UnexpectedVariantType StellaIdent Type
   | TupleIndexOutOfBounds Integer Type
   | WrongArityMain Int
+  | NonexhaustivePatternMatching [Pattern] Expr Type
   deriving (Eq, Ord, Read)
 
 instance Show TypeCheckerError where
@@ -274,6 +275,16 @@ instance Show TypeCheckerError where
         ++ show actual
         ++ " arguments in body?\n    "
         ++ printTree expr
+    NonexhaustivePatternMatching patterns e t ->
+      "ERROR_NONEXHAUSTIVE_MATCH_PATTERNS:\n"
+        ++ "  Set  of patterns\n"
+        ++ "  "
+        ++ intercalate ", " (map printTree patterns)
+        ++ "  does not cover all the values of expession "
+        ++ "  "
+        ++ printTree e
+        ++ " of type "
+        ++ printTree t
 
 type TypeCheckerResult t = Either TypeCheckerError t
 
@@ -298,12 +309,11 @@ typeCheck program@(AProgram _ _ decls) = do
       decls <- decls_result
       case lookup (StellaIdent "main") decls of
         Nothing -> Left NoMain
-        Just (TypeFun [_] _) ->  case duplicateIn [name | (name, _) <- decls] of
+        Just (TypeFun [_] _) -> case duplicateIn [name | (name, _) <- decls] of
           Nothing -> return decls
           (Just duplicated) -> Left $ DuplicateFunctionDeclaration duplicated
-        Just (TypeFun args _) -> Left $ WrongArityMain $ length args 
+        Just (TypeFun args _) -> Left $ WrongArityMain $ length args
         Just _ -> Left NoMain
-
 
 -- Common utils
 
@@ -379,13 +389,33 @@ joinPatternContexts contexts =
    in if haveNoDuplicates result then return result else Left DuplicateVariablePattern
 
 -- Checks whether bunch of patterns covers all possible values of a type
+-- Prerequisite: all patterns shall match the type (e.g. checked via patternContext function)
+-- WIP: structural patterns exhaustiveness check
+isExhaustive :: Type -> [Pattern] -> Bool
+isExhaustive t@(TypeSum _ _) patterns =
+  any (isIrrefutable t) patterns || (any isPatternForInl patterns && any isPatternForInr patterns)
+  where
+    isPatternForInl (PatternInl (PatternVar _)) = True
+    isPatternForInl _ = False
+    isPatternForInr (PatternInr (PatternVar _)) = True
+    isPatternForInr _ = False
+isExhaustive t@(TypeVariant members) patterns =
+  any (isIrrefutable t) patterns || all (\member -> any (isPatternForVariantField member) patterns) members
+  where
+    isPatternForVariantField :: VariantFieldType -> Pattern -> Bool
+    isPatternForVariantField (AVariantFieldType label (SomeTyping _)) (PatternVariant label' (SomePatternData (PatternVar _))) = label == label'
+    isPatternForVariantField (AVariantFieldType label NoTyping) (PatternVariant label' NoPatternData) = label == label'
+    isPatternForVariantField _ _ = False
+isExhaustive _ _ = False
 
 -- Checks whether pattern is irrefutable
-isIrrefutable :: Pattern -> Type -> Bool
-isIrrefutable (PatternVar _) _ = True
-isIrrefutable (PatternTuple pats) (TypeTuple types) =
-  all (uncurry isIrrefutable) $ zip pats types
-isIrrefutable (PatternRecord pats) (TypeRecord fiels) = False
+-- Prerequisite: pattern shall match the type (e.g. checked via patternContext function)
+-- WIP: structural patterns exhaustiveness check
+isIrrefutable :: Type -> Pattern -> Bool
+isIrrefutable _ (PatternVar _) = True
+-- isIrrefutable (TypeTuple types) (PatternTuple pats) =
+--  all (uncurry isIrrefutable) $ zip types pats
+-- isIrrefutable (TypeRecord fiels) (PatternRecord pats) = False -- TODO
 isIrrefutable _ _ = False
 
 -- Produces the context which consists with binded names after matching expression of type `t`
@@ -489,10 +519,14 @@ infer ctx (Inr e) = Left AmbigousSumType
 infer ctx (Match e []) = Left EmptyMatch
 infer ctx (Match e cases@(c : cs)) = do
   t <- infer ctx e
+  let patterns = [pattern | (AMatchCase pattern _) <- cases]
   branches_types <- sequence [patternContext pattern t >>= (\ctx' -> infer (ctx' ++ ctx) b) | (AMatchCase pattern b) <- cases]
-  if allEqual branches_types
-    then return $ head branches_types
-    else Left MismatchedBranchesTypes
+  if not (isExhaustive t patterns)
+    then Left $ NonexhaustivePatternMatching patterns e t
+    else
+      if allEqual branches_types
+        then return $ head branches_types
+        else Left MismatchedBranchesTypes
 infer ctx (List []) = Left AmbigousListType
 infer ctx (List exprs@(h : t)) = do
   exprs_types <- sequence $ infer ctx <$> exprs
@@ -575,7 +609,10 @@ ensure ctx (Inr e) (TypeSum _ r) = ensure ctx e r
 ensure ctx e@(Inr _) t = Left $ UnexpectedInjection e t
 ensure ctx (Match e cases@(c : cs)) expected = do
   t <- infer ctx e
-  sequence_ [patternContext pattern t >>= (\ctx' -> ensure (ctx' ++ ctx) b expected) | (AMatchCase pattern b) <- cases]
+  let patterns = [pattern | (AMatchCase pattern _) <- cases]
+  if not (isExhaustive t patterns)
+    then Left $ NonexhaustivePatternMatching patterns e t
+    else sequence_ [patternContext pattern t >>= (\ctx' -> ensure (ctx' ++ ctx) b expected) | (AMatchCase pattern b) <- cases]
 ensure ctx (List []) (TypeList _) = return ()
 ensure ctx (List exprs) (TypeList expected) = sequence_ $ [ensure ctx expr expected | expr <- exprs]
 ensure ctx e@(List _) t = Left $ UnexpectedList e t

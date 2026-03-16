@@ -1,0 +1,7 @@
+Lex.hs
+Par.hs
+Par.info
+build/Syntax/*
+build/*.hi
+build/*.o
+Check

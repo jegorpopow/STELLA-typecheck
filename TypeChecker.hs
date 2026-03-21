@@ -290,30 +290,50 @@ type TypeCheckerResult t = Either TypeCheckerError t
 
 type Context = [(StellaIdent, Type)]
 
+type FunctionSignature = (StellaIdent, Type)
+
+extractFunctionSignature :: Decl -> TypeCheckerResult FunctionSignature
+extractFunctionSignature (DeclFun _ name params (SomeReturnType return_type) _ _ _) = Right (name, TypeFun [t | (AParamDecl _ t) <- params] return_type)
+extractFunctionSignature decl = Left $ UnsupportedDecl decl
+
+collectFuncDecls :: [Decl] -> TypeCheckerResult [FunctionSignature]
+collectFuncDecls decls = sequence $ extractFunctionSignature <$> decls
+
+typeCheckFunction :: Context -> Decl -> TypeCheckerResult ()
+typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
+  let extendedCtx = paramsToContext params ++ ctx
+  () <- typecheckFunctions extendedCtx nested
+  nestedFunctionCtx <- collectFuncDecls nested
+  let bodyContext = nestedFunctionCtx ++ extendedCtx
+  validate'n'ensure'ctx bodyContext body return_type
+typeCheckFunction _ decl = Left $ UnsupportedDecl decl
+
+typecheckFunctions :: Context -> [Decl] -> TypeCheckerResult ()
+typecheckFunctions ctx decls = do
+  signatures <- collectFuncDecls decls
+  functionsCtx <- ensureNoDuplicates signatures
+  let extendedCtx = functionsCtx ++ ctx
+  sequence_ $ typeCheckFunction extendedCtx <$> decls
+  where
+    ensureNoDuplicates :: [FunctionSignature] -> TypeCheckerResult Context
+    ensureNoDuplicates signatures =
+      case duplicateIn [name | (name, _) <- signatures] of
+        Nothing -> Right signatures
+        Just duplicated -> Left $ DuplicateFunctionDeclaration duplicated
+
 -- Entry point of type checker: checks the whole program
 typeCheck :: Program -> TypeCheckerResult ()
 typeCheck program@(AProgram _ _ decls) = do
-  globalDecls <- collectFuncDecls program
-  sequence_ $ typeCheckDecl globalDecls <$> decls
+  () <- collectFuncDecls decls >>= ensureMainValid
+  typecheckFunctions [] decls
   where
-    typeCheckDecl globalDecls (DeclFun _ name params (SomeReturnType return_type) _ _ body) =
-      validate'n'ensure'ctx (paramsToContext params ++ globalDecls) body return_type
-    typeCheckDecl _ _ = return ()
-    extractFunctionType :: Decl -> TypeCheckerResult (StellaIdent, Type)
-    extractFunctionType (DeclFun _ name params (SomeReturnType return_type) _ _ _) = Right (name, TypeFun [t | (AParamDecl _ t) <- params] return_type)
-    extractFunctionType decl = Left $ UnsupportedDecl decl
-    collectFuncDecls :: Program -> TypeCheckerResult Context
-    collectFuncDecls (AProgram _ _ decls) = ensureDeclsCorrectness . sequence $ extractFunctionType <$> decls
-    ensureDeclsCorrectness :: TypeCheckerResult Context -> TypeCheckerResult Context
-    ensureDeclsCorrectness decls_result = do
-      decls <- decls_result
+    ensureMainValid :: [FunctionSignature] -> TypeCheckerResult ()
+    ensureMainValid decls =
       case lookup (StellaIdent "main") decls of
         Nothing -> Left NoMain
-        Just (TypeFun [_] _) -> case duplicateIn [name | (name, _) <- decls] of
-          Nothing -> return decls
-          (Just duplicated) -> Left $ DuplicateFunctionDeclaration duplicated
+        Just (TypeFun [_] _) -> Right ()
         Just (TypeFun args _) -> Left $ WrongArityMain $ length args
-        Just _ -> Left NoMain
+        Just _ -> Left NoMain -- main is not a function, but it still abscent, so let it be "NoMain" error
 
 -- Common utils
 
@@ -551,13 +571,14 @@ infer ctx (IsEmpty list) = do
     (TypeList e) -> return TypeBool
     _ -> Left $ NotAList list
 infer ctx (Variant label (SomeExprData expr)) = Left AmbigousVariantType
-infer ctx (Fix f) = do
+infer ctx e@(Fix f) = do
   arrow <- infer ctx f
   case arrow of
     (TypeFun [arg] ret) ->
       if arg == ret
         then return arg
         else Left $ UnexpectedType f (TypeFun [ret] ret) arrow
+    (TypeFun args _) -> Left $ MismatchedArgumentsNumber 1 (length args) e
     _ -> Left $ NotAFunction f
 infer _ e = Left $ UnsupportedExpression e
 

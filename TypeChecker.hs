@@ -3,8 +3,6 @@
 module Syntax.TypeChecker where
 
 import Control.Monad (unless)
-import qualified Control.Monad
-import Data.Foldable (sequenceA_)
 import Data.List (intercalate, nub, (\\))
 import Data.Maybe (fromJust, isNothing)
 import qualified Data.Set as S
@@ -43,10 +41,11 @@ import Syntax.Abs
         Variant
       ),
     ExprData (NoExprData, SomeExprData),
+    LabelledPattern (ALabelledPattern),
     MatchCase (AMatchCase),
     OptionalTyping (NoTyping, SomeTyping),
     ParamDecl (AParamDecl),
-    Pattern (PatternAsc, PatternInl, PatternInr, PatternRecord, PatternTuple, PatternVar, PatternVariant),
+    Pattern (PatternAsc, PatternCons, PatternFalse, PatternInl, PatternInr, PatternInt, PatternList, PatternRecord, PatternSucc, PatternTrue, PatternTuple, PatternUnit, PatternVar, PatternVariant),
     PatternBinding (..),
     PatternData (NoPatternData, SomePatternData),
     Program (..),
@@ -302,7 +301,7 @@ collectFuncDecls decls = sequence $ extractFunctionSignature <$> decls
 typeCheckFunction :: Context -> Decl -> TypeCheckerResult ()
 typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
   let extendedCtx = paramsToContext params ++ ctx
-  () <- typecheckFunctions extendedCtx nested
+  typecheckFunctions extendedCtx nested
   nestedFunctionCtx <- collectFuncDecls nested
   let bodyContext = nestedFunctionCtx ++ extendedCtx
   validate'n'ensure'ctx bodyContext body return_type
@@ -324,7 +323,7 @@ typecheckFunctions ctx decls = do
 -- Entry point of type checker: checks the whole program
 typeCheck :: Program -> TypeCheckerResult ()
 typeCheck program@(AProgram _ _ decls) = do
-  () <- collectFuncDecls decls >>= ensureMainValid
+  collectFuncDecls decls >>= ensureMainValid
   typecheckFunctions [] decls
   where
     ensureMainValid :: [FunctionSignature] -> TypeCheckerResult ()
@@ -371,8 +370,8 @@ extractRecordFieldType label fields = case lookup label [(name, t) | (ARecordFie
   (Just t) -> return t
 
 -- Ensures that records value have correct record fiedls
-suitsRecordType :: [Binding] -> [RecordFieldType] -> TypeCheckerResult ()
-suitsRecordType actual_bindings expected_bindings
+exprSuitsRecordType :: [Binding] -> [RecordFieldType] -> TypeCheckerResult ()
+exprSuitsRecordType actual_bindings expected_bindings
   | not (all (`elem` expected) actual) = Left $ UnexpectedFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
   | not (all (`elem` actual) expected) = Left $ MissingFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
   | otherwise = return ()
@@ -380,18 +379,28 @@ suitsRecordType actual_bindings expected_bindings
     actual = [name | (ABinding name _) <- actual_bindings]
     expected = [name | (ARecordFieldType name _) <- expected_bindings]
 
+-- Ensures that records value have correct record fiedls
+patternSuitsRecordType :: [LabelledPattern] -> [RecordFieldType] -> TypeCheckerResult ()
+patternSuitsRecordType actual_bindings expected_bindings
+  | not (all (`elem` expected) actual) = Left $ UnexpectedPatternForType (PatternRecord actual_bindings) (TypeRecord expected_bindings)
+  | not (all (`elem` actual) expected) = Left $ UnexpectedPatternForType (PatternRecord actual_bindings) (TypeRecord expected_bindings)
+  | otherwise = return ()
+  where
+    actual = [name | (ALabelledPattern name _) <- actual_bindings]
+    expected = [name | (ARecordFieldType name _) <- expected_bindings]
+
 --Checks well-formed types. Basicly just checks tht records and variants have unique names for fields or members
 validateType :: Type -> TypeCheckerResult Type
 validateType t@(TypeRecord fields) =
   case duplicateIn [name | (ARecordFieldType name _) <- fields] of
     Nothing -> do
-      () <- sequence_ $ validateType <$> [t | (ARecordFieldType _ t) <- fields]
+      sequence_ $ validateType <$> [t | (ARecordFieldType _ t) <- fields]
       return t
     Just duplicate -> Left $ DuplicateRecordFields duplicate t
 validateType t@(TypeVariant members) =
   case duplicateIn [name | (AVariantFieldType name _) <- members] of
     Nothing -> do
-      () <- sequence_ $ validateType <$> [t | (AVariantFieldType _ (SomeTyping t)) <- members]
+      sequence_ $ validateType <$> [t | (AVariantFieldType _ (SomeTyping t)) <- members]
       return t
     Just duplicate -> Left $ DuplicateRecordFields duplicate t
 validateType t = Right t
@@ -438,8 +447,30 @@ isIrrefutable _ _ = False
 -- against specific pattern
 patternContext :: Pattern -> Type -> TypeCheckerResult Context
 patternContext (PatternVar name) t = return [(name, t)]
+patternContext (PatternAsc p t') t = do
+  -- unless (t' == t) (Left $ UnexpectedPatternForType p t')
+  patternContext p t
 patternContext (PatternInl pattern) (TypeSum l _) = patternContext pattern l
+patternContext PatternUnit TypeUnit = Right []
+patternContext PatternFalse TypeBool = Right []
+patternContext PatternTrue TypeBool = Right []
+patternContext (PatternInt _) TypeNat = Right []
+patternContext (PatternSucc p) TypeNat = patternContext p TypeNat
 patternContext p@(PatternInl pattern) t = Left $ UnexpectedPatternForType p t
+patternContext p@(PatternList patterns) (TypeList elemType) =
+  sequence [patternContext pat elemType | pat <- patterns] >>= joinPatternContexts
+patternContext p@(PatternCons headPattern tailPattern) t@(TypeList elemType) = do
+  a <- patternContext headPattern elemType
+  b <- patternContext tailPattern t
+  joinPatternContexts [a, b]
+patternContext (PatternRecord labels) (TypeRecord fields) = do
+  patternSuitsRecordType labels fields
+  let fields_patterns = [(name, pat) | (ALabelledPattern name pat) <- labels]
+  ctxs <- sequence [extractRecordFieldType name fields >>= patternContext pat | (ALabelledPattern name pat) <- labels]
+  joinPatternContexts ctxs
+patternContext p@(PatternTuple pats) t@(TypeTuple fields) = do
+  unless (length pats == length fields) (Left $ UnexpectedPatternForType p t)
+  sequence [patternContext pat ty | (pat, ty) <- zip pats fields] >>= joinPatternContexts
 patternContext (PatternInr pattern) (TypeSum _ r) = patternContext pattern r
 patternContext p@(PatternInr pattern) t = Left $ UnexpectedPatternForType p t
 patternContext p@(PatternVariant label (SomePatternData inner)) t@(TypeVariant members) = do
@@ -468,35 +499,33 @@ infer :: Context -> Expr -> TypeCheckerResult Type
 infer _ ConstTrue = return TypeBool
 infer _ ConstFalse = return TypeBool
 infer ctx (If c t e) = do
-  () <- ensure ctx c TypeBool
+  ensure ctx c TypeBool
   lhs <- infer ctx t
-  () <- ensure ctx e lhs
+  ensure ctx e lhs
   return lhs
 infer ctx (Abstraction params body) = do
-  () <- sequence_ $ validateType <$> [t | (AParamDecl _ t) <- params]
+  sequence_ $ validateType <$> [t | (AParamDecl _ t) <- params]
   return_type <- infer ([(name, t) | (AParamDecl name t) <- params] ++ ctx) body
   return $ TypeFun [t | (AParamDecl name t) <- params] return_type
 infer ctx e@(Application callee args) = do
   callee_type <- infer ctx callee
   case callee_type of
-    (TypeFun params return_type) ->
-      if length params == length args
-        then do
-          () <- sequence_ [ensure ctx a p | (p, a) <- zip params args]
-          return return_type
-        else Left $ MismatchedArgumentsNumber (length params) (length args) e
+    (TypeFun params return_type) -> do
+      unless (length params == length args) (Left $ MismatchedArgumentsNumber (length params) (length args) e)
+      sequence_ [ensure ctx a p | (p, a) <- zip params args]
+      return return_type
     _ -> Left $ NotAFunction callee
 infer _ (ConstInt _) = return TypeNat
 infer ctx (Succ num) = do
-  () <- ensure ctx num TypeNat
+  ensure ctx num TypeNat
   return TypeNat
 infer ctx (IsZero num) = do
-  () <- ensure ctx num TypeNat
+  ensure ctx num TypeNat
   return TypeBool
 infer ctx (NatRec num init step) = do
-  () <- ensure ctx num TypeNat
+  ensure ctx num TypeNat
   t <- infer ctx init
-  () <- ensure ctx step (TypeFun [TypeNat] $ TypeFun [t] t)
+  ensure ctx step (TypeFun [TypeNat] $ TypeFun [t] t)
   return t
 infer ctx (Var name) = do
   case lookup name ctx of
@@ -536,8 +565,8 @@ infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
 infer ctx (LetRec [APatternBinding pattern expr] body) = Left $ UnsupportedConstruction "letrec without type ascription"
 infer ctx (LetRec _ body) = Left $ UnsupportedConstruction "letrec with many bindings"
 infer ctx (TypeAsc e t) = do
-  _ <- validateType t
-  () <- ensure ctx e t
+  validateType t
+  ensure ctx e t
   return t
 infer ctx (Inl e) = Left AmbigousSumType
 infer ctx (Inr e) = Left AmbigousSumType
@@ -558,7 +587,7 @@ infer ctx (List exprs@(h : t)) = do
   if allEqual exprs_types then return $ TypeList $ head exprs_types else Left MismatchedListTypes
 infer ctx (ConsList head tail) = do
   t <- infer ctx head
-  () <- ensure ctx tail (TypeList t)
+  ensure ctx tail (TypeList t)
   return (TypeList t)
 infer ctx (Head list) = do
   t <- infer ctx list
@@ -596,8 +625,8 @@ ensure _ ConstTrue expected = Left $ UnexpectedType ConstTrue expected TypeBool
 ensure _ ConstFalse TypeBool = return ()
 ensure _ ConstFalse expected = Left $ UnexpectedType ConstFalse expected TypeBool
 ensure ctx (If c t e) expected = do
-  () <- ensure ctx c TypeBool
-  () <- ensure ctx t expected
+  ensure ctx c TypeBool
+  ensure ctx t expected
   ensure ctx e expected
 ensure ctx e@(Abstraction params body) (TypeFun expected_args return_type) = do
   let actual_args = [t | (AParamDecl name t) <- params]
@@ -615,8 +644,8 @@ ensure ctx e@(Abstraction _ _) t = Left $ UnexpectedLambda e t
 ensure _ (ConstInt _) TypeNat = return ()
 ensure _ e@(ConstInt _) expected = Left $ UnexpectedType e expected TypeNat
 ensure ctx (NatRec num init step) expected = do
-  () <- ensure ctx num TypeNat
-  () <- ensure ctx init expected
+  ensure ctx num TypeNat
+  ensure ctx init expected
   ensure ctx step (TypeFun [TypeNat] $ TypeFun [expected] expected)
 ensure _ ConstUnit TypeUnit = return ()
 ensure _ ConstUnit expected = Left $ UnexpectedType ConstUnit expected TypeUnit
@@ -626,7 +655,7 @@ ensure ctx t@(Tuple elems) e@(TypeTuple tuple_elems)
 ensure ctx e@(Tuple elems) t = Left $ UnexpectedTuple e t
 ensure ctx (Record bindings) t@(TypeRecord fields) = do
   _ <- validateType t
-  () <- suitsRecordType bindings fields
+  exprSuitsRecordType bindings fields
   sequence_ [extractRecordFieldType name fields >>= ensure ctx e | (ABinding name e) <- bindings]
 ensure ctx e@(Record _) t = Left $ UnexpectedRecord e t
 ensure ctx (Inl e) (TypeSum l _) = ensure ctx e l
@@ -643,7 +672,7 @@ ensure ctx (List []) (TypeList _) = return ()
 ensure ctx (List exprs) (TypeList expected) = sequence_ $ [ensure ctx expr expected | expr <- exprs]
 ensure ctx e@(List _) t = Left $ UnexpectedList e t
 ensure ctx (ConsList head tail) t@(TypeList expected) = do
-  () <- ensure ctx head expected
+  ensure ctx head expected
   ensure ctx tail t
 ensure ctx e@(ConsList head tail) t = Left $ UnexpectedList e t
 ensure ctx (Head list) expected = ensure ctx list (TypeList expected)
@@ -688,11 +717,10 @@ ensure ctx expr expected = do
 validate'n'ensure :: Context -> Expr -> Type -> TypeCheckerResult ()
 validate'n'ensure ctx e t = do
   t' <- validateType t
-  -- () <- sequence_ $ validateType . snd <$> ctx
   ensure ctx e t'
 
 -- validate context + validate target + ensure
 validate'n'ensure'ctx :: Context -> Expr -> Type -> TypeCheckerResult ()
 validate'n'ensure'ctx ctx e t = do
-  () <- sequence_ $ validateType . snd <$> ctx
+  sequence_ $ validateType . snd <$> ctx
   validate'n'ensure ctx e t

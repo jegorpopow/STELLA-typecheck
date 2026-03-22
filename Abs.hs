@@ -60,6 +60,7 @@ data Type
     | TypeRef Type
     | TypeVar StellaIdent
   deriving (C.Eq, C.Ord, C.Show, C.Read)
+  -- TODO: implement nonderived Eq for propper Records handling
 
 data MatchCase = AMatchCase Pattern Expr
   deriving (C.Eq, C.Ord, C.Show, C.Read)

@@ -28,7 +28,7 @@ Additionally, tool supports following extensions:
 * Nullary variant labels
 * Nested funсtions
 * `letrec`-bindings
-* Structural patterns: WIP
+* Structural patterns
 
 ## Build & run
 

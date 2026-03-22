@@ -3,10 +3,12 @@
 module Syntax.TypeChecker where
 
 import Control.Monad (unless)
+import Data.Either (fromLeft, fromRight)
 import Data.List (intercalate, nub, (\\))
 import Data.Maybe (fromJust, isNothing)
 import qualified Data.Set as S
 import Debug.Trace (trace)
+import Language.Haskell.TH (Con)
 import Syntax.Abs
   ( Binding (ABinding),
     Decl (DeclFun),
@@ -45,7 +47,7 @@ import Syntax.Abs
     MatchCase (AMatchCase),
     OptionalTyping (NoTyping, SomeTyping),
     ParamDecl (AParamDecl),
-    Pattern (PatternAsc, PatternCons, PatternFalse, PatternInl, PatternInr, PatternInt, PatternList, PatternRecord, PatternSucc, PatternTrue, PatternTuple, PatternUnit, PatternVar, PatternVariant),
+    Pattern (PatternAsc, PatternCastAs, PatternCons, PatternFalse, PatternInl, PatternInr, PatternInt, PatternList, PatternRecord, PatternSucc, PatternTrue, PatternTuple, PatternUnit, PatternVar, PatternVariant),
     PatternBinding (..),
     PatternData (NoPatternData, SomePatternData),
     Program (..),
@@ -82,6 +84,7 @@ data TypeCheckerError
   | DuplicateRecordFields StellaIdent Type
   | DuplicateVariantType StellaIdent Type
   | DuplicateFunctionDeclaration StellaIdent
+  | DuplicateRecordPattern StellaIdent Pattern
   | AmbigousSumType
   | AmbigousVariantType
   | AmbigousListType
@@ -122,6 +125,7 @@ instance Show TypeCheckerError where
     WrongArityMain n ->
       "ERROR_INCORRECT_ARITY_OF_MAIN\n  main have " ++ show n ++ " arguments"
     DuplicateFunctionDeclaration name -> "ERROR_DUPLICATE_FUNCTION_DECLARATION:\n  Function " ++ show name ++ " declaraded several times"
+    DuplicateRecordPattern name pattern -> "ERROR_DUPLICATE_RECORD_PATTERN_FIELDS:\n  Pattern " ++ printTree pattern ++ " contains multiple occurences of label " ++ printTree name
     UndefinedVariable ident ->
       "ERROR_UNDEFINED_VARIABLE:\n  undefined variable " ++ show ident
     UnexpectedType expr expected inferred ->
@@ -415,7 +419,7 @@ joinPatternContexts contexts =
 
 -- Checks whether bunch of patterns covers all possible values of a type
 -- Prerequisite: all patterns shall match the type (e.g. checked via patternContext function)
--- WIP: structural patterns exhaustiveness check
+-- Legacy implementation, does not support structural patterns. vide isEchaustiveStructural
 isExhaustive :: Type -> [Pattern] -> Bool
 isExhaustive t@(TypeSum _ _) patterns =
   any (isIrrefutable t) patterns || (any isPatternForInl patterns && any isPatternForInr patterns)
@@ -433,15 +437,139 @@ isExhaustive t@(TypeVariant members) patterns =
     isPatternForVariantField _ _ = False
 isExhaustive t pts = any (isIrrefutable t) pts
 
+-- Pattern matching exhaustiveness check utils
+
 -- Checks whether pattern is irrefutable
 -- Prerequisite: pattern shall match the type (e.g. checked via patternContext function)
--- WIP: structural patterns exhaustiveness check
 isIrrefutable :: Type -> Pattern -> Bool
 isIrrefutable _ (PatternVar _) = True
--- isIrrefutable (TypeTuple types) (PatternTuple pats) =
---  all (uncurry isIrrefutable) $ zip types pats
--- isIrrefutable (TypeRecord fiels) (PatternRecord pats) = False -- TODO
+isIrrefutable TypeUnit PatternUnit = True
+isIrrefutable (TypeTuple types) (PatternTuple pats) =
+  all (uncurry isIrrefutable) $ zip types pats
+isIrrefutable (TypeRecord fields) (PatternRecord pats) =
+  all (uncurry isIrrefutable) $ fromRight [] $ sequence [(,pat) <$> extractRecordFieldType name fields | (ALabelledPattern name pat) <- pats]
 isIrrefutable _ _ = False
+
+getRawIdent :: StellaIdent -> String
+getRawIdent (StellaIdent a) = a
+
+-- Generalised representation of albebraical data type variant
+data Constructor a = Constructor
+  { constrOver :: Type,
+    constrName :: String,
+    constrChildren :: [a]
+  }
+  deriving (Eq, Show, Read)
+
+constrArity :: Constructor a -> Int
+constrArity = length . constrChildren
+
+-- Checks whether pattern constructor matches againts specific constructor
+constructorMatchesImpl :: Constructor a -> Constructor b -> Bool
+constructorMatchesImpl consPat consType = constrOver consPat == constrOver consType && constrName consPat == constrName consType
+
+patternMatchesConstructor :: Pattern -> Constructor Type -> Bool
+patternMatchesConstructor p c =
+  case matchedConstructor (constrOver c) p of
+    Nothing -> False
+    Just p -> constructorMatchesImpl p c
+
+-- Lists the constructors for type
+listConstructors :: Type -> [Constructor Type]
+listConstructors TypeUnit = [Constructor TypeUnit "unit" []]
+listConstructors TypeBool = [Constructor TypeBool "true" [], Constructor TypeBool "false" []]
+listConstructors TypeNat = [Constructor TypeNat "zero" [], Constructor TypeNat "succ" [TypeNat]]
+listConstructors t@(TypeList elem) = [Constructor t "nil" [], Constructor t "cons" [elem, t]]
+listConstructors t@(TypeSum l r) = [Constructor t "inl" [l], Constructor t "inr" [r]]
+listConstructors t@(TypeVariant members) = [Constructor t (getRawIdent name) (optionalTypingToArr ty) | (AVariantFieldType name ty) <- members]
+  where
+    optionalTypingToArr (SomeTyping t) = [t]
+    optionalTypingToArr NoTyping = []
+listConstructors t@(TypeTuple fields) = [Constructor t "tuple" fields]
+listConstructors t@(TypeRecord fields) = [Constructor t "tuple" [t | (ARecordFieldType _ t) <- fields]]
+listConstructors _ = error "Exhaustiveness check internal error" -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
+
+-- Evaluates which constructor of known type is covered with known pattern. Nothing stands for all the constructors
+matchedConstructor :: Type -> Pattern -> Maybe (Constructor Pattern)
+matchedConstructor t (PatternVar _) = Nothing
+matchedConstructor t (PatternAsc p _) = matchedConstructor t p
+matchedConstructor TypeBool PatternTrue = Just $ Constructor TypeBool "true" []
+matchedConstructor TypeBool PatternFalse = Just $ Constructor TypeBool "false" []
+matchedConstructor TypeUnit PatternUnit = Just $ Constructor TypeUnit "unit" []
+matchedConstructor t p@(PatternInt 0) = Just $ Constructor t "zero" []
+matchedConstructor t p@(PatternInt n) = error $ "Exhaustiveness check internal error:\n  " ++ printTree p ++ "\n  " ++ printTree t
+matchedConstructor t p@(PatternSucc ch) = Just $ Constructor t "succ" [ch]
+matchedConstructor t (PatternInl pattern) = Just $ Constructor t "inl" [pattern]
+matchedConstructor t (PatternInr pattern) = Just $ Constructor t "inr" [pattern]
+matchedConstructor t p@(PatternList []) = Just $ Constructor t "nil" []
+matchedConstructor t p@(PatternList (h : t')) = error $ "Exhaustiveness check internal error:\n  " ++ printTree p ++ "\n  " ++ printTree t
+matchedConstructor t@(TypeList elem) (PatternCons h t') = Just $ Constructor t "cons" [h, t']
+matchedConstructor t@(TypeRecord fields) (PatternRecord pats) =
+  Just $
+    Constructor t "record" $
+      fromJust $
+        sequence [lookup label patsMap | (ARecordFieldType label t) <- fields]
+  where
+    patsMap = [(label, pat) | (ALabelledPattern label pat) <- pats]
+matchedConstructor t (PatternTuple fields) = Just $ Constructor t "tuple" fields
+matchedConstructor t (PatternVariant label (SomePatternData inner)) = Just $ Constructor t (getRawIdent label) [inner]
+matchedConstructor t (PatternVariant label NoPatternData) = Just $ Constructor t (getRawIdent label) []
+matchedConstructor t p = error $ "Exhaustiveness check internal error:\n  " ++ printTree p ++ "\n  " ++ printTree t
+
+-- Removes all the (PatternInt n) where n > 0 and (PatternList elems) where elems is not empty
+-- TODO: rewrite Pattern Type with `Fix` to simplify recursive application of desugarPattern
+desugarPattern :: Pattern -> Pattern
+desugarPattern (PatternAsc p t) = PatternAsc (desugarPattern p) t
+desugarPattern p@(PatternInt 0) = p
+desugarPattern (PatternInt n) = PatternSucc $ desugarPattern (PatternInt $ n - 1)
+desugarPattern (PatternSucc ch) = PatternSucc $ desugarPattern ch
+desugarPattern (PatternInl pattern) = PatternInl $ desugarPattern pattern
+desugarPattern (PatternInr pattern) = PatternInr $ desugarPattern pattern
+desugarPattern p@(PatternList []) = p
+desugarPattern p@(PatternList (h : t)) = PatternCons h $ desugarPattern $ PatternList t
+desugarPattern (PatternCons h t) = PatternCons (desugarPattern h) $ desugarPattern t
+desugarPattern (PatternRecord fields) = PatternRecord [ALabelledPattern name $ desugarPattern pat | (ALabelledPattern name pat) <- fields]
+desugarPattern (PatternTuple fields) = PatternTuple $ desugarPattern <$> fields
+desugarPattern (PatternVariant label (SomePatternData inner)) = PatternVariant label $ SomePatternData $ desugarPattern inner
+desugarPattern p = p
+
+-- Given a matrix of patterns returns whether sum of all rows of matrix covers all the cases
+-- of given types. One column of matrix corresponds one type in a list of types
+allCovered :: [[Pattern]] -> [Type] -> Bool
+allCovered rows [] = not . null $ rows
+allCovered rows (t : rest) =
+  let firstColumn = map head rows
+   in if all (isIrrefutable t) firstColumn
+        then allCovered (map tail rows) rest
+        else
+          let constructorsToCover = listConstructors t
+           in all (matchesConstructor rows rest) constructorsToCover
+  where
+    headMatches :: Constructor Type -> [Pattern] -> Bool
+    headMatches constr (p : _) =
+      isIrrefutable (constrOver constr) p
+        || patternMatchesConstructor p constr
+    headMatches _ [] = False
+    matchesConstructor :: [[Pattern]] -> [Type] -> Constructor Type -> Bool
+    matchesConstructor rows ts c =
+      let matchedRows = filter (headMatches c) rows
+       in not (null matchedRows)
+            && ( let extendedRows = concatMap (extendRow c) matchedRows
+                  in allCovered extendedRows (constrChildren c ++ ts)
+               )
+    extendRow :: Constructor Type -> [Pattern] -> [[Pattern]]
+    extendRow c r@(h : rest) =
+      if isIrrefutable (constrOver c) h
+        then [replicate (constrArity c) (PatternVar (StellaIdent "_")) ++ rest]
+        else case matchedConstructor (constrOver c) h of
+          Nothing -> []
+          Just pats -> [constrChildren pats ++ rest]
+    extendRow c [] = []
+
+-- Checks whether structural pattern binding is exhaustive
+-- Prerequidite: patternContext does not emit error for any of patterns
+isExhaustiveStructural :: Type -> [Pattern] -> Bool
+isExhaustiveStructural t patterns = let rows = [[desugarPattern pat] | pat <- patterns] in allCovered rows [t]
 
 -- Produces the context which consists with binded names after matching expression of type `t`
 -- against specific pattern
@@ -463,7 +591,10 @@ patternContext p@(PatternCons headPattern tailPattern) t@(TypeList elemType) = d
   a <- patternContext headPattern elemType
   b <- patternContext tailPattern t
   joinPatternContexts [a, b]
-patternContext (PatternRecord labels) (TypeRecord fields) = do
+patternContext p@(PatternRecord labels) (TypeRecord fields) = do
+  case duplicateIn [name | (ALabelledPattern name pat) <- labels] of
+    Nothing -> return ()
+    Just duplicated -> Left $ DuplicateRecordPattern duplicated p
   patternSuitsRecordType labels fields
   let fields_patterns = [(name, pat) | (ALabelledPattern name pat) <- labels]
   ctxs <- sequence [extractRecordFieldType name fields >>= patternContext pat | (ALabelledPattern name pat) <- labels]
@@ -483,15 +614,15 @@ patternContext p@(PatternVariant label NoPatternData) t@(TypeVariant members) = 
   case typing of
     NoTyping -> return []
     SomeTyping ty -> Left $ UnexpectedNullaryPattern label p t
-patternContext p@(PatternVariant label (SomePatternData inner)) t = Left $ UnexpectedPatternForType p t
 patternContext p t = Left $ UnexpectedPatternForType p t
 
 -- Just infer + patternContext for PatternBinding
 patternBindingContext :: Context -> PatternBinding -> TypeCheckerResult Context
 patternBindingContext ctx (APatternBinding pattern expr) = do
   t <- infer ctx expr
-  unless (isExhaustive t [pattern]) (Left $ NonexhaustivePatternMatching [pattern] expr t)
-  patternContext pattern t
+  res <- patternContext pattern t
+  unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
+  return res
 
 -- inference function: calculates type of expression based on its structure and context
 -- Context contains information of externally defined variables types, with respect to possible shadowing
@@ -557,8 +688,8 @@ infer ctx (Let bindings body) = do
   patternsCtx <- joinPatternContexts patternCtxs
   infer (patternsCtx ++ ctx) body
 infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
-  unless (isExhaustive t [pattern]) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   ctx' <- patternContext pattern t
+  unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   let extendedCtx = ctx' ++ ctx
   ensure extendedCtx expr t
   infer extendedCtx body
@@ -575,7 +706,7 @@ infer ctx (Match e cases@(c : cs)) = do
   t <- infer ctx e
   let patterns = [pattern | (AMatchCase pattern _) <- cases]
   branches_types <- sequence [patternContext pattern t >>= (\ctx' -> infer (ctx' ++ ctx) b) | (AMatchCase pattern b) <- cases]
-  if not (isExhaustive t patterns)
+  if not (isExhaustiveStructural t patterns)
     then Left $ NonexhaustivePatternMatching patterns e t
     else
       if allEqual branches_types
@@ -665,9 +796,8 @@ ensure ctx e@(Inr _) t = Left $ UnexpectedInjection e t
 ensure ctx (Match e cases@(c : cs)) expected = do
   t <- infer ctx e
   let patterns = [pattern | (AMatchCase pattern _) <- cases]
-  if not (isExhaustive t patterns)
-    then Left $ NonexhaustivePatternMatching patterns e t
-    else sequence_ [patternContext pattern t >>= (\ctx' -> ensure (ctx' ++ ctx) b expected) | (AMatchCase pattern b) <- cases]
+  sequence_ [patternContext pattern t >>= (\ctx' -> ensure (ctx' ++ ctx) b expected) | (AMatchCase pattern b) <- cases]
+  unless (isExhaustiveStructural t patterns) $ Left $ NonexhaustivePatternMatching patterns e t
 ensure ctx (List []) (TypeList _) = return ()
 ensure ctx (List exprs) (TypeList expected) = sequence_ $ [ensure ctx expr expected | expr <- exprs]
 ensure ctx e@(List _) t = Left $ UnexpectedList e t
@@ -688,8 +818,8 @@ ensure ctx (Let bindings body) t = do
   patternsCtx <- joinPatternContexts patternCtxs
   ensure (patternsCtx ++ ctx) body t
 ensure ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) t' = do
-  unless (isExhaustive t [pattern]) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   ctx' <- patternContext pattern t
+  unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   let extendedCtx = ctx' ++ ctx
   ensure extendedCtx expr t
   ensure extendedCtx body t'

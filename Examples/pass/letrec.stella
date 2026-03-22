@@ -1,0 +1,21 @@
+language core;
+
+extend with
+  #unit-type,
+  #references,
+  #arithmetic-operators,
+  #sequencing,
+  #natural-literals,
+  #nested-function-declarations,
+  #letrec-bindings,
+  #let-patterns,
+  #tuples,
+  #structural-patterns,
+  #pattern-ascriptions,
+  #lists;
+
+
+
+fn main(n : Nat) -> [Nat] {
+  return cons(1, [])
+}

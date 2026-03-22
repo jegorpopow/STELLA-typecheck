@@ -1,9 +1,8 @@
 {-# LANGUAGE TupleSections #-}
 
--- {-# OPTIONS_GHC -Wno-overlapping-patterns #-}
-
 module Syntax.TypeChecker where
 
+import Control.Monad (unless)
 import qualified Control.Monad
 import Data.Foldable (sequenceA_)
 import Data.List (intercalate, nub, (\\))
@@ -31,6 +30,7 @@ import Syntax.Abs
         IsEmpty,
         IsZero,
         Let,
+        LetRec,
         List,
         Match,
         NatRec,
@@ -46,7 +46,7 @@ import Syntax.Abs
     MatchCase (AMatchCase),
     OptionalTyping (NoTyping, SomeTyping),
     ParamDecl (AParamDecl),
-    Pattern (PatternInl, PatternInr, PatternRecord, PatternTuple, PatternVar, PatternVariant),
+    Pattern (PatternAsc, PatternInl, PatternInr, PatternRecord, PatternTuple, PatternVar, PatternVariant),
     PatternBinding (..),
     PatternData (NoPatternData, SomePatternData),
     Program (..),
@@ -426,7 +426,7 @@ isExhaustive t@(TypeVariant members) patterns =
     isPatternForVariantField (AVariantFieldType label (SomeTyping _)) (PatternVariant label' (SomePatternData (PatternVar _))) = label == label'
     isPatternForVariantField (AVariantFieldType label NoTyping) (PatternVariant label' NoPatternData) = label == label'
     isPatternForVariantField _ _ = False
-isExhaustive _ _ = False
+isExhaustive t pts = any (isIrrefutable t) pts
 
 -- Checks whether pattern is irrefutable
 -- Prerequisite: pattern shall match the type (e.g. checked via patternContext function)
@@ -463,6 +463,7 @@ patternContext p t = Left $ UnexpectedPatternForType p t
 patternBindingContext :: Context -> PatternBinding -> TypeCheckerResult Context
 patternBindingContext ctx (APatternBinding pattern expr) = do
   t <- infer ctx expr
+  unless (isExhaustive t [pattern]) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   patternContext pattern t
 
 -- inference function: calculates type of expression based on its structure and context
@@ -527,9 +528,17 @@ infer ctx (DotRecord record field) = do
         Nothing -> Left $ UnexpectedRecordField record_type field
     _ -> Left $ NotARecord record
 infer ctx (Let bindings body) = do
-  pattern_contexts <- sequence $ patternBindingContext ctx <$> bindings
-  renewed_context <- joinPatternContexts pattern_contexts
-  infer (renewed_context ++ ctx) body
+  patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
+  patternsCtx <- joinPatternContexts patternCtxs
+  infer (patternsCtx ++ ctx) body
+infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
+  unless (isExhaustive t [pattern]) (Left $ NonexhaustivePatternMatching [pattern] expr t)
+  ctx' <- patternContext pattern t
+  let extendedCtx = ctx' ++ ctx
+  ensure extendedCtx expr t
+  infer extendedCtx body
+infer ctx (LetRec [APatternBinding pattern expr] body) = Left $ UnsupportedConstruction "letrec without type ascription"
+infer ctx (LetRec _ body) = Left $ UnsupportedConstruction "letrec with many bindings"
 infer ctx (TypeAsc e t) = do
   _ <- validateType t
   () <- ensure ctx e t
@@ -637,9 +646,9 @@ ensure ctx (Match e cases@(c : cs)) expected = do
 ensure ctx (List []) (TypeList _) = return ()
 ensure ctx (List exprs) (TypeList expected) = sequence_ $ [ensure ctx expr expected | expr <- exprs]
 ensure ctx e@(List _) t = Left $ UnexpectedList e t
-ensure ctx (ConsList head tail) (TypeList expected) = do
+ensure ctx (ConsList head tail) t@(TypeList expected) = do
   () <- ensure ctx head expected
-  ensure ctx tail expected
+  ensure ctx tail t
 ensure ctx e@(ConsList head tail) t = Left $ UnexpectedList e t
 ensure ctx (Head list) expected = ensure ctx list (TypeList expected)
 ensure ctx (Tail list) expected@(TypeList _) = ensure ctx list expected
@@ -649,6 +658,18 @@ ensure ctx e@(Variant label (SomeExprData expr)) t@(TypeVariant members) = do
   case expected of
     NoTyping -> Left $ UnexpectedDataForNullaryType label e t
     SomeTyping ty -> ensure ctx expr ty
+ensure ctx (Let bindings body) t = do
+  patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
+  patternsCtx <- joinPatternContexts patternCtxs
+  ensure (patternsCtx ++ ctx) body t
+ensure ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) t' = do
+  unless (isExhaustive t [pattern]) (Left $ NonexhaustivePatternMatching [pattern] expr t)
+  ctx' <- patternContext pattern t
+  let extendedCtx = ctx' ++ ctx
+  ensure extendedCtx expr t
+  ensure extendedCtx body t'
+ensure ctx (LetRec [APatternBinding pattern expr] body) _ = Left $ UnsupportedConstruction "letrec without type ascription"
+ensure ctx (LetRec _ body) _ = Left $ UnsupportedConstruction "letrec with many bindings"
 ensure ctx e@(Variant label NoExprData) t@(TypeVariant members) = do
   expected <- extractVariantMemberType label members
   case expected of

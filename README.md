@@ -1,11 +1,14 @@
 # Stella programming language typechecker
 
-ITMO PLSTS course supplemetary
+ITMO PLSTS course supplementary
 
 Lexer & Parser are generated via BNFC tool. 
 Type checker implementation is placed into `TypeChecker.hs` file
 
 ## Supported features
+
+`extend with` section is not checked, the tool considers all the following extensions are
+on all the time:
 
 * Core language
 * Unit type
@@ -18,24 +21,23 @@ Type checker implementation is placed into `TypeChecker.hs` file
 * Variants
 * Fixpoint combinator
 
-Additionally, tool supports following extensions
+Additionally, tool supports following extensions:
 
 * Natural literals
 * Nullary & multiparameter functions
 * Nullary variant labels
+* Nested funсtions
+* `letrec`-bindings
 * Structural patterns: WIP
-* Nested fucntions: WIP
-* `letrec`-bindings: WIP
 
 ## Build & run
 
 The requirements are:
 * GHC >= 8.10.7
-* BNFC >= 2.9.6
 * alex >= 3.3.0
 * happy >= 1.20.1
 
-Building command:
+Building commands:
 
 ```bash
 alex --ghc Lex.x 
@@ -53,6 +55,6 @@ cat source.stella | ./Check
 
 # Tests
 
-Folder `Oleg_testuite` contains [test suite creted by Oleg Haykin](https://github.com/ThatDraenGuy/stella_test_suite/)
+Folder `Oleg_testuite` contains [test suite created by Oleg Haykin](https://github.com/ThatDraenGuy/stella_test_suite/)
 
-Folder `Examples` contains my own examples (`pass` are well-typed ones and `fail` are ill-typed ones, basicly, name of test correspondes expected error code). 
+Folder `Examples` contains my own examples (`pass` are well-typed ones and `fail` are ill-typed ones. Basicly, name of the test corresponds expected error code). 

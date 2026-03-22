@@ -79,7 +79,7 @@ data TypeCheckerError
   | NotARecord Expr
   | NotAList Expr
   | UnexpectedTupleLength Int Int Type Expr
-  | DuplicateVariablePattern
+  | DuplicateVariablePattern StellaIdent
   | DuplicateRecordFields StellaIdent Type
   | DuplicateVariantType StellaIdent Type
   | DuplicateFunctionDeclaration StellaIdent
@@ -227,8 +227,8 @@ instance Show TypeCheckerError where
         ++ printTree e
         ++ "  of length "
         ++ show actualLength
-    DuplicateVariablePattern ->
-      "ERROR_DUPLICATE_VARIABLE_PATTERN:\n  duplicate variable in pattern"
+    DuplicateVariablePattern name ->
+      "ERROR_DUPLICATE_VARIABLE_PATTERN:\n  duplicate variable in pattern:\n" ++ printTree name
     DuplicateRecordFields field t ->
       "ERROR_DUPLICATE_RECORD_FIELDS:\n  duplicate field: " ++ show field ++ " in record type " ++ printTree t
     DuplicateVariantType field t ->
@@ -345,12 +345,6 @@ duplicateIn = go S.empty
       | x `S.member` seen = Just x
       | otherwise = go (S.insert x seen) xs
 
-haveNoDuplicates :: Eq a => [a] -> Bool
-haveNoDuplicates l = length l == length (nub l)
-
-ensureNoDuplicates :: Eq a => [a] -> e -> Either e ()
-ensureNoDuplicates l err = if haveNoDuplicates l then Right () else Left err
-
 areEqualAsSets :: Ord a => [a] -> [a] -> Bool
 areEqualAsSets xs ys = S.fromList xs == S.fromList ys
 
@@ -376,7 +370,7 @@ extractRecordFieldType label fields = case lookup label [(name, t) | (ARecordFie
   Nothing -> Left $ UnexpectedRecordField (TypeRecord fields) label
   (Just t) -> return t
 
--- Ensures that two records types are the same type
+-- Ensures that records value have correct record fiedls
 suitsRecordType :: [Binding] -> [RecordFieldType] -> TypeCheckerResult ()
 suitsRecordType actual_bindings expected_bindings
   | not (all (`elem` expected) actual) = Left $ UnexpectedFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
@@ -406,7 +400,9 @@ validateType t = Right t
 joinPatternContexts :: [Context] -> TypeCheckerResult Context
 joinPatternContexts contexts =
   let result = concat contexts
-   in if haveNoDuplicates result then return result else Left DuplicateVariablePattern
+   in case duplicateIn [name | (name, _) <- result] of
+        Nothing -> return result
+        Just duplicated -> Left $ DuplicateVariablePattern duplicated
 
 -- Checks whether bunch of patterns covers all possible values of a type
 -- Prerequisite: all patterns shall match the type (e.g. checked via patternContext function)

@@ -81,13 +81,16 @@ data TypeCheckerError
   | NotAList Expr
   | UnexpectedTupleLength Int Int Type Expr
   | DuplicateVariablePattern StellaIdent
+  | DuplicateVariableLet StellaIdent
   | DuplicateRecordTypeFields StellaIdent Type
   | DuplicateVariantTypeMembers StellaIdent Type
   | DuplicateRecordFields StellaIdent Expr
   | DuplicateFunctionDeclaration StellaIdent
+  | DuplicateFunctionParameterName StellaIdent
   | DuplicateRecordPattern StellaIdent Pattern
   | AmbigousSumType
   | AmbigousVariantType
+  | AmbigousPatternType Pattern
   | AmbigousListType
   | UnexpectedRecordField Type StellaIdent
   | UnexpectedTypeForParameter [Type] [Type]
@@ -137,6 +140,8 @@ instance Show TypeCheckerError where
         ++ "\n"
         ++ "  for expression:\n    "
         ++ printTree expr
+    AmbigousPatternType pat ->
+      "ERROR_AMBIGUOUS_PATTERN_TYPE:\n  Can not infer type for pattern: " ++ printTree pat
     NotAFunction expr ->
       "ERROR_NOT_A_FUNCTION:\n  expression is not a function: " ++ printTree expr
     NotATuple expr ->
@@ -229,8 +234,12 @@ instance Show TypeCheckerError where
         ++ printTree e
         ++ "  of length "
         ++ show actualLength
+    DuplicateVariableLet name ->
+      "ERROR_DUPLICATE_LET_BINDING:\n  duplicate variable in let:\n" ++ printTree name
     DuplicateVariablePattern name ->
       "ERROR_DUPLICATE_VARIABLE_PATTERN:\n  duplicate variable in pattern:\n" ++ printTree name
+    DuplicateFunctionParameterName name ->
+      "ERROR_DUPLICATE_FUNCTION_PARAMETER:\n  duplicate parameter name:\n" ++ printTree name
     DuplicateRecordFields field e ->
       "ERROR_DUPLICATE_RECORD_FIELDS:\n  duplicate field: " ++ show field ++ " in record expression " ++ printTree e
     DuplicateRecordTypeFields field t ->
@@ -260,7 +269,7 @@ instance Show TypeCheckerError where
         ++ " does not match type "
         ++ printTree ty
     MismatchedArgumentsNumber expected actual expr ->
-      "ERROR_MISMATCHED_ARGUMENTS_NUMBER:\n"
+      "ERROR_INCORRECT_NUMBER_OF_ARGUMENTS:\n"
         ++ "  expected "
         ++ show expected
         ++ " arguments but got "
@@ -268,7 +277,7 @@ instance Show TypeCheckerError where
         ++ " in application:\n    "
         ++ printTree expr
     UnexpectedArgumentsNumberInLambda expected actual expr ->
-      "ERROR_UNEXPECTED_ARGUMENTS_NUMBER_IN_LAMBDA:\n"
+      "ERROR_UNEXPECTED_NUMBER_OF_PARAMETERS_IN_LAMBDA:\n"
         ++ "  lambda expects "
         ++ show expected
         ++ " parameters but got "
@@ -301,7 +310,8 @@ collectFuncDecls decls = sequence $ extractFunctionSignature <$> decls
 
 typeCheckFunction :: Context -> Decl -> TypeCheckerResult ()
 typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
-  let extendedCtx = paramsToContext params ++ ctx
+  ctxExtension <- paramsToContext params
+  let extendedCtx = ctxExtension ++ ctx
   typecheckFunctions extendedCtx nested
   nestedFunctionCtx <- collectFuncDecls nested
   let bodyContext = nestedFunctionCtx ++ extendedCtx
@@ -355,8 +365,11 @@ allEqual (x : xs) = all (== x) xs
 -- Typechecking-specific utils
 
 -- Builds a context prefics based on function parameters description
-paramsToContext :: [ParamDecl] -> Context
-paramsToContext decls = [(name, t) | (AParamDecl name t) <- decls]
+paramsToContext :: [ParamDecl] -> TypeCheckerResult Context
+paramsToContext decls =
+  case duplicateIn [name | (AParamDecl name t) <- decls] of
+    Just name -> Left $ DuplicateFunctionParameterName name
+    Nothing -> return [(name, t) | (AParamDecl name t) <- decls]
 
 -- Extracts a type of member with label `label` of a type `TypeVariant members`
 extractVariantMemberType :: StellaIdent -> [VariantFieldType] -> TypeCheckerResult OptionalTyping
@@ -452,6 +465,24 @@ isIrrefutable (TypeTuple types) (PatternTuple pats) =
 isIrrefutable (TypeRecord fields) (PatternRecord pats) =
   all (uncurry isIrrefutable) $ fromRight [] $ sequence [(,pat) <$> extractRecordFieldType name fields | (ALabelledPattern name pat) <- pats]
 isIrrefutable _ _ = False
+
+namesInPattern :: Pattern -> [StellaIdent]
+namesInPattern (PatternAsc pat _) = namesInPattern pat
+namesInPattern (PatternVariant _ (SomePatternData pat)) = namesInPattern pat
+namesInPattern (PatternVariant _ NoPatternData) = []
+namesInPattern (PatternInl pat) = namesInPattern pat
+namesInPattern (PatternInr pat) = namesInPattern pat
+namesInPattern (PatternTuple pats) = concatMap namesInPattern pats
+namesInPattern (PatternRecord pats) = concatMap namesInPattern ([pat | (ALabelledPattern _ pat) <- pats])
+namesInPattern (PatternList pats) = concatMap namesInPattern pats
+namesInPattern (PatternCons a b) = namesInPattern a ++ namesInPattern b
+namesInPattern PatternFalse = []
+namesInPattern PatternTrue = []
+namesInPattern PatternUnit = []
+namesInPattern (PatternInt _) = []
+namesInPattern (PatternSucc pat) = namesInPattern pat
+namesInPattern (PatternVar name) = [name]
+namesInPattern (PatternCastAs pat _) = namesInPattern pat
 
 getRawIdent :: StellaIdent -> String
 getRawIdent (StellaIdent a) = a
@@ -617,7 +648,7 @@ patternContext p@(PatternInr pattern) t = Left $ UnexpectedPatternForType p t
 patternContext p@(PatternVariant label (SomePatternData inner)) t@(TypeVariant members) = do
   typing <- patternSuitsVariantType label p members
   case typing of
-    NoTyping -> Left $ UnexpectedNullaryPattern label p t
+    NoTyping -> Left $ UnexpectedNonNullaryPattern label p t
     SomeTyping ty -> patternContext inner ty
 patternContext p@(PatternVariant label NoPatternData) t@(TypeVariant members) = do
   typing <- patternSuitsVariantType label p members
@@ -651,6 +682,7 @@ infer ctx (If c t e) = do
   ensure ctx e lhs
   return lhs
 infer ctx (Abstraction params body) = do
+  _ <- paramsToContext params
   sequence_ $ validateType <$> [t | (AParamDecl _ t) <- params]
   return_type <- infer ([(name, t) | (AParamDecl name t) <- params] ++ ctx) body
   return $ TypeFun [t | (AParamDecl name t) <- params] return_type
@@ -701,16 +733,24 @@ infer ctx (DotRecord record field) = do
         Nothing -> Left $ UnexpectedRecordField record_type field
     _ -> Left $ NotARecord record
 infer ctx (Let bindings body) = do
-  patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
-  patternsCtx <- joinPatternContexts patternCtxs
-  infer (patternsCtx ++ ctx) body
+  let bindedNames = concatMap namesInPattern [pat | (APatternBinding pat _) <- bindings]
+  case duplicateIn bindedNames of
+    Just name -> Left $ DuplicateVariableLet name
+    Nothing -> do
+      patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
+      patternsCtx <- joinPatternContexts patternCtxs
+      infer (patternsCtx ++ ctx) body
 infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
-  ctx' <- patternContext pattern t
-  unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
-  let extendedCtx = ctx' ++ ctx
-  ensure extendedCtx expr t
-  infer extendedCtx body
-infer ctx (LetRec [APatternBinding pattern expr] body) = Left $ UnsupportedConstruction "letrec without type ascription"
+  let bindedNames = namesInPattern pattern
+  case duplicateIn bindedNames of
+    Just name -> Left $ DuplicateVariableLet name
+    Nothing -> do      
+      ctx' <- patternContext pattern t
+      unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
+      let extendedCtx = ctx' ++ ctx
+      ensure extendedCtx expr t
+      infer extendedCtx body
+infer ctx (LetRec [APatternBinding pattern expr] body) = Left $ AmbigousPatternType pattern
 infer ctx (LetRec _ body) = Left $ UnsupportedConstruction "letrec with many bindings"
 infer ctx (TypeAsc e t) = do
   validateType t
@@ -780,6 +820,7 @@ ensure ctx (If c t e) expected = do
   ensure ctx t expected
   ensure ctx e expected
 ensure ctx e@(Abstraction params body) (TypeFun expected_args return_type) = do
+  _ <- paramsToContext params
   let actual_args = [t | (AParamDecl name t) <- params]
   if length expected_args /= length actual_args
     then Left $ UnexpectedArgumentsNumberInLambda (length expected_args) (length actual_args) e
@@ -834,16 +875,20 @@ ensure ctx e@(Variant label (SomeExprData expr)) t@(TypeVariant members) = do
     NoTyping -> Left $ UnexpectedDataForNullaryType label e t
     SomeTyping ty -> ensure ctx expr ty
 ensure ctx (Let bindings body) t = do
-  patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
-  patternsCtx <- joinPatternContexts patternCtxs
-  ensure (patternsCtx ++ ctx) body t
+  let bindedNames = concatMap namesInPattern [pat | (APatternBinding pat _) <- bindings]
+  case duplicateIn bindedNames of
+    Just name -> Left $ DuplicateVariableLet name
+    Nothing -> do
+      patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
+      patternsCtx <- joinPatternContexts patternCtxs
+      ensure (patternsCtx ++ ctx) body t
 ensure ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) t' = do
   ctx' <- patternContext pattern t
   unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   let extendedCtx = ctx' ++ ctx
   ensure extendedCtx expr t
   ensure extendedCtx body t'
-ensure ctx (LetRec [APatternBinding pattern expr] body) _ = Left $ UnsupportedConstruction "letrec without type ascription"
+ensure ctx (LetRec [APatternBinding pattern expr] body) _ = Left $ AmbigousPatternType pattern
 ensure ctx (LetRec _ body) _ = Left $ UnsupportedConstruction "letrec with many bindings"
 ensure ctx e@(Variant label NoExprData) t@(TypeVariant members) = do
   expected <- extractVariantMemberType label members

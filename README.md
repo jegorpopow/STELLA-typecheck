@@ -37,7 +37,7 @@ The requirements are:
 * alex >= 3.3.0
 * happy >= 1.20.1
 
-Building commands:
+Building commands (or just run `build.sh`):
 
 ```bash
 alex --ghc Lex.x 

@@ -2,7 +2,7 @@
 
 module Syntax.TypeChecker where
 
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.Either (fromLeft, fromRight)
 import Data.List (intercalate, nub, (\\))
 import Data.Maybe (fromJust, isNothing)
@@ -81,8 +81,9 @@ data TypeCheckerError
   | NotAList Expr
   | UnexpectedTupleLength Int Int Type Expr
   | DuplicateVariablePattern StellaIdent
-  | DuplicateRecordFields StellaIdent Type
-  | DuplicateVariantType StellaIdent Type
+  | DuplicateRecordTypeFields StellaIdent Type
+  | DuplicateVariantTypeMembers StellaIdent Type
+  | DuplicateRecordFields StellaIdent Expr
   | DuplicateFunctionDeclaration StellaIdent
   | DuplicateRecordPattern StellaIdent Pattern
   | AmbigousSumType
@@ -94,8 +95,6 @@ data TypeCheckerError
   | UnsupportedDecl Decl
   | UnsupportedPattern Pattern
   | UnsupportedConstruction String
-  | MismatchedBranchesTypes
-  | MismatchedListTypes
   | MissingFields [StellaIdent] [StellaIdent] Expr Type
   | UnexpectedFields [StellaIdent] [StellaIdent] Expr Type
   | EmptyMatch
@@ -232,9 +231,11 @@ instance Show TypeCheckerError where
         ++ show actualLength
     DuplicateVariablePattern name ->
       "ERROR_DUPLICATE_VARIABLE_PATTERN:\n  duplicate variable in pattern:\n" ++ printTree name
-    DuplicateRecordFields field t ->
-      "ERROR_DUPLICATE_RECORD_FIELDS:\n  duplicate field: " ++ show field ++ " in record type " ++ printTree t
-    DuplicateVariantType field t ->
+    DuplicateRecordFields field e ->
+      "ERROR_DUPLICATE_RECORD_FIELDS:\n  duplicate field: " ++ show field ++ " in record expression " ++ printTree e
+    DuplicateRecordTypeFields field t ->
+      "ERROR_DUPLICATE_RECORD_TYPE_FIELDS:\n  duplicate field: " ++ show field ++ " in record type " ++ printTree t
+    DuplicateVariantTypeMembers field t ->
       "ERROR_DUPLICATE_VARIANT_TYPE_FIELDS:\n  duplicate field: " ++ show field ++ " in variant type " ++ printTree t
     AmbigousSumType ->
       "ERROR_AMBIGUOUS_SUM_TYPE:\n  ambiguous sum type (cannot determine type of injection)"
@@ -250,10 +251,6 @@ instance Show TypeCheckerError where
       "ERROR_UNSUPPORTED_PATTERN:\n  unsupported pattern: " ++ printTree pat
     UnsupportedConstruction s ->
       "ERROR_UNSUPPORTED_CONSTRUCTION:\n  unsupported construction: " ++ s
-    MismatchedBranchesTypes ->
-      "ERROR_MISMATCHED_BRANCHES_TYPES:\n  branches in match have different types"
-    MismatchedListTypes ->
-      "ERROR_MISMATCHED_LIST_TYPES:\n  list elements have inconsistent types"
     EmptyMatch ->
       "ERROR_ILLEGAL_EMPTY_MATCHING:\n  match expression with no branches"
     UnexpectedPatternForType pat ty ->
@@ -393,6 +390,12 @@ patternSuitsRecordType actual_bindings expected_bindings
     actual = [name | (ALabelledPattern name _) <- actual_bindings]
     expected = [name | (ARecordFieldType name _) <- expected_bindings]
 
+patternSuitsVariantType :: StellaIdent -> Pattern -> [VariantFieldType] -> TypeCheckerResult OptionalTyping
+patternSuitsVariantType label p variants =
+  case extractVariantMemberType label variants of
+    Left _ -> Left $ UnexpectedPatternForType p $ TypeVariant variants
+    Right x -> return x
+
 --Checks well-formed types. Basicly just checks tht records and variants have unique names for fields or members
 validateType :: Type -> TypeCheckerResult Type
 validateType t@(TypeRecord fields) =
@@ -400,13 +403,13 @@ validateType t@(TypeRecord fields) =
     Nothing -> do
       sequence_ $ validateType <$> [t | (ARecordFieldType _ t) <- fields]
       return t
-    Just duplicate -> Left $ DuplicateRecordFields duplicate t
+    Just duplicate -> Left $ DuplicateRecordTypeFields duplicate t
 validateType t@(TypeVariant members) =
   case duplicateIn [name | (AVariantFieldType name _) <- members] of
     Nothing -> do
       sequence_ $ validateType <$> [t | (AVariantFieldType _ (SomeTyping t)) <- members]
       return t
-    Just duplicate -> Left $ DuplicateRecordFields duplicate t
+    Just duplicate -> Left $ DuplicateVariantTypeMembers duplicate t
 validateType t = Right t
 
 -- Joins a contexts produced by several simultaneously matched patterns (e.g. in multivariable let or in PatternTuple)
@@ -566,6 +569,13 @@ allCovered rows (t : rest) =
           Just pats -> [constrChildren pats ++ rest]
     extendRow c [] = []
 
+-- Finds first non-expected type and returns an erorr
+findNonExpected :: Type -> [(Type, Expr)] -> TypeCheckerResult ()
+findNonExpected expected ((t, e) : rest) = do
+  when (t /= expected) $ Left $ UnexpectedType e expected t
+  findNonExpected expected rest
+findNonExpected expected [] = return ()
+
 -- Checks whether structural pattern binding is exhaustive
 -- Prerequidite: patternContext does not emit error for any of patterns
 isExhaustiveStructural :: Type -> [Pattern] -> Bool
@@ -605,12 +615,12 @@ patternContext p@(PatternTuple pats) t@(TypeTuple fields) = do
 patternContext (PatternInr pattern) (TypeSum _ r) = patternContext pattern r
 patternContext p@(PatternInr pattern) t = Left $ UnexpectedPatternForType p t
 patternContext p@(PatternVariant label (SomePatternData inner)) t@(TypeVariant members) = do
-  typing <- extractVariantMemberType label members
+  typing <- patternSuitsVariantType label p members
   case typing of
     NoTyping -> Left $ UnexpectedNullaryPattern label p t
     SomeTyping ty -> patternContext inner ty
 patternContext p@(PatternVariant label NoPatternData) t@(TypeVariant members) = do
-  typing <- extractVariantMemberType label members
+  typing <- patternSuitsVariantType label p members
   case typing of
     NoTyping -> return []
     SomeTyping ty -> Left $ UnexpectedNullaryPattern label p t
@@ -623,6 +633,12 @@ patternBindingContext ctx (APatternBinding pattern expr) = do
   res <- patternContext pattern t
   unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
   return res
+
+ensureNoRecordDuplicateFileds :: [Binding] -> TypeCheckerResult ()
+ensureNoRecordDuplicateFileds bindings =
+  case duplicateIn [name | (ABinding name e) <- bindings] of
+    Just ident -> Left $ DuplicateRecordFields ident $ Record bindings
+    Nothing -> return ()
 
 -- inference function: calculates type of expression based on its structure and context
 -- Context contains information of externally defined variables types, with respect to possible shadowing
@@ -673,6 +689,7 @@ infer ctx (DotTuple tuple index) = do
         else Left $ TupleIndexOutOfBounds index tuple_type
     _ -> Left $ NotATuple tuple
 infer ctx (Record bindings) = do
+  ensureNoRecordDuplicateFileds bindings
   element_types <- sequence $ [(name,) <$> infer ctx e | (ABinding name e) <- bindings]
   validateType $ TypeRecord $ uncurry ARecordFieldType <$> element_types
 infer ctx (DotRecord record field) = do
@@ -706,16 +723,19 @@ infer ctx (Match e cases@(c : cs)) = do
   t <- infer ctx e
   let patterns = [pattern | (AMatchCase pattern _) <- cases]
   branches_types <- sequence [patternContext pattern t >>= (\ctx' -> infer (ctx' ++ ctx) b) | (AMatchCase pattern b) <- cases]
+  let expected_type = head branches_types
+  let rest_types = tail branches_types
+  let rest_exprs = [b | (AMatchCase pattern b) <- cs]
+  findNonExpected expected_type $ zip rest_types rest_exprs
   if not (isExhaustiveStructural t patterns)
     then Left $ NonexhaustivePatternMatching patterns e t
-    else
-      if allEqual branches_types
-        then return $ head branches_types
-        else Left MismatchedBranchesTypes
+    else return expected_type
 infer ctx (List []) = Left AmbigousListType
 infer ctx (List exprs@(h : t)) = do
-  exprs_types <- sequence $ infer ctx <$> exprs
-  if allEqual exprs_types then return $ TypeList $ head exprs_types else Left MismatchedListTypes
+  head_type <- infer ctx h
+  tails_types <- sequence $ infer ctx <$> t
+  findNonExpected head_type $ zip tails_types t
+  return $ TypeList head_type
 infer ctx (ConsList head tail) = do
   t <- infer ctx head
   ensure ctx tail (TypeList t)
@@ -786,6 +806,7 @@ ensure ctx t@(Tuple elems) e@(TypeTuple tuple_elems)
 ensure ctx e@(Tuple elems) t = Left $ UnexpectedTuple e t
 ensure ctx (Record bindings) t@(TypeRecord fields) = do
   _ <- validateType t
+  ensureNoRecordDuplicateFileds bindings
   exprSuitsRecordType bindings fields
   sequence_ [extractRecordFieldType name fields >>= ensure ctx e | (ABinding name e) <- bindings]
 ensure ctx e@(Record _) t = Left $ UnexpectedRecord e t
@@ -807,7 +828,6 @@ ensure ctx (ConsList head tail) t@(TypeList expected) = do
 ensure ctx e@(ConsList head tail) t = Left $ UnexpectedList e t
 ensure ctx (Head list) expected = ensure ctx list (TypeList expected)
 ensure ctx (Tail list) expected@(TypeList _) = ensure ctx list expected
-ensure ctx e@(Tail list) t = Left $ UnexpectedList e t
 ensure ctx e@(Variant label (SomeExprData expr)) t@(TypeVariant members) = do
   expected <- extractVariantMemberType label members
   case expected of

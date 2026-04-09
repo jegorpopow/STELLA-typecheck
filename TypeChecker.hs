@@ -43,6 +43,8 @@ import Syntax.Abs
         Variant
       ),
     ExprData (NoExprData, SomeExprData),
+    Extension (AnExtension),
+    ExtensionName (ExtensionName),
     LabelledPattern (ALabelledPattern),
     MatchCase (AMatchCase),
     OptionalTyping (NoTyping, SomeTyping),
@@ -331,9 +333,18 @@ typecheckFunctions ctx decls = do
         Nothing -> Right signatures
         Just duplicated -> Left $ DuplicateFunctionDeclaration duplicated
 
+data TCCfg = Cfg
+  { cfgBotInfer :: Bool,
+    cfgSubTypes :: Bool
+  }
+
+extensionNames :: [Extension] -> [String]
+extensionNames ext_decls = [name | (AnExtension exts) <- ext_decls, (ExtensionName name) <- exts]
+
 -- Entry point of type checker: checks the whole program
 typeCheck :: Program -> TypeCheckerResult ()
-typeCheck program@(AProgram _ _ decls) = do
+typeCheck program@(AProgram _ extensions decls) = do
+  let cfg = let names = extensionNames extensions in Cfg ("ambiguous-type-as-bottom" `elem` names) ("structural-subtyping" `elem` names)
   collectFuncDecls decls >>= ensureMainValid
   typecheckFunctions [] decls
   where
@@ -744,7 +755,7 @@ infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
   let bindedNames = namesInPattern pattern
   case duplicateIn bindedNames of
     Just name -> Left $ DuplicateVariableLet name
-    Nothing -> do      
+    Nothing -> do
       ctx' <- patternContext pattern t
       unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
       let extendedCtx = ctx' ++ ctx

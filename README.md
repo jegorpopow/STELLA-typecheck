@@ -8,7 +8,8 @@ Type checker implementation is placed into `TypeChecker.hs` file
 ## Supported features
 
 `extend with` section is not checked, the tool considers all the following extensions are
-on all the time:
+on all the time (exception are `#structured-subtyping` and `#ambiguous-type-as-bottom`, which 
+influence all the type-checking process):
 
 * Core language
 * Unit type
@@ -20,6 +21,12 @@ on all the time:
 * Lists
 * Variants
 * Fixpoint combinator
+* Sequencing
+* References
+* Panic
+* Exceptions and exception handling
+* Structural subtyping
+* Ambiguousness elimination via bottom type injection 
 
 Additionally, tool supports following extensions:
 
@@ -29,6 +36,8 @@ Additionally, tool supports following extensions:
 * Nested funсtions
 * `letrec`-bindings
 * Structural patterns
+* Open variant exception type
+* Downcast (via `cast as` expression and pattern mathcing)
 
 ## Build & run
 
@@ -37,7 +46,9 @@ The requirements are:
 * alex >= 3.3.0
 * happy >= 1.20.1
 
-Building commands (or just run `build.sh`):
+Makefile is provided
+
+Building commands for manual build:
 
 ```bash
 alex --ghc Lex.x 

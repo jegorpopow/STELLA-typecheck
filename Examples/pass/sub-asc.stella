@@ -1,0 +1,11 @@
+language core;
+extend with #records;
+extend with #let-bindings;
+extend with #let-patterns;
+extend with #structural-subtyping;
+extend with #unit-type;
+extend with #type-ascriptions;
+
+fn main(n : Nat) -> { a : Nat } {
+  return let x = { a = 0, b = true, c = unit } as {a : Nat, b : Bool} in x
+}

@@ -1,0 +1,26 @@
+language core;
+
+extend with
+ #variants, 
+ #let-bindings,
+ #let-patterns,
+ #exceptions, 
+ #exception-type-declaration,
+ #structural-subtyping,
+ #open-variant-exceptions,
+ #records,
+ #structural-patterns,
+ #type-ascriptions,
+ #tuples,
+ #bottom-type,
+ #sum-types;
+
+exception type = Nat
+
+fn throwing(a : Nat) -> Nat{
+  return throw(0)
+}
+
+fn main(n : Nat) -> Nat {
+  return try {throwing(0)} catch {n => succ(n)}
+}

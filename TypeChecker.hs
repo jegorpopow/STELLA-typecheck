@@ -2,24 +2,28 @@
 
 module Syntax.TypeChecker where
 
-import Control.Monad (unless, when)
+import Cmm (Section)
+import Control.Monad (unless, void, when)
 import Data.Either (fromLeft, fromRight)
 import Data.List (intercalate, nub, (\\))
 import Data.Maybe (fromJust, isNothing)
 import qualified Data.Set as S
-import Debug.Trace (trace)
+import Debug.Trace (trace, traceM)
 import Language.Haskell.TH (Con)
 import Syntax.Abs
   ( Binding (ABinding),
-    Decl (DeclFun),
+    Decl (DeclExceptionType, DeclExceptionVariant, DeclFun),
     Expr
       ( Abstraction,
         Application,
+        Assign,
         ConsList,
         ConstFalse,
         ConstInt,
+        ConstMemory,
         ConstTrue,
         ConstUnit,
+        Deref,
         DotRecord,
         DotTuple,
         Fix,
@@ -34,9 +38,16 @@ import Syntax.Abs
         List,
         Match,
         NatRec,
+        Panic,
         Record,
+        Ref,
+        Sequence,
         Succ,
         Tail,
+        Throw,
+        TryCastAs,
+        TryCatch,
+        TryWith,
         Tuple,
         TypeAsc,
         Var,
@@ -58,11 +69,14 @@ import Syntax.Abs
     StellaIdent (StellaIdent),
     Type
       ( TypeBool,
+        TypeBottom,
         TypeFun,
         TypeList,
         TypeNat,
         TypeRecord,
+        TypeRef,
         TypeSum,
+        TypeTop,
         TypeTuple,
         TypeUnit,
         TypeVariant
@@ -77,10 +91,14 @@ data TypeCheckerError
   = NoMain
   | UndefinedVariable StellaIdent
   | UnexpectedType {expr :: Expr, expected :: Type, infered :: Type}
+  | UnexpectedSubtype {expr :: Expr, expected :: Type, infered :: Type}
+  | UnexpectedSubtypeNoExpr {expected :: Type, infered :: Type}
   | NotAFunction Expr
   | NotATuple Expr
   | NotARecord Expr
   | NotAList Expr
+  | NotAReference Expr
+  | ConflicitingExceptionDeclarations
   | UnexpectedTupleLength Int Int Type Expr
   | DuplicateVariablePattern StellaIdent
   | DuplicateVariableLet StellaIdent
@@ -90,7 +108,12 @@ data TypeCheckerError
   | DuplicateFunctionDeclaration StellaIdent
   | DuplicateFunctionParameterName StellaIdent
   | DuplicateRecordPattern StellaIdent Pattern
+  | DuplicateExceptionType
+  | DuplicateExceptionVariant StellaIdent
   | AmbigousSumType
+  | AmbigousPanicType Expr
+  | AmbigousThrowType Expr
+  | AmbigousReferenceType Expr
   | AmbigousVariantType
   | AmbigousPatternType Pattern
   | AmbigousListType
@@ -107,6 +130,8 @@ data TypeCheckerError
   | UnexpectedTuple Expr Type
   | UnexpectedRecord Expr Type
   | UnexpectedInjection Expr Type
+  | UnexpectedReference Expr Type
+  | UnexpectedMemoryAddress Expr Type
   | UnexpectedList Expr Type
   | UnexpectedVariant Expr Type
   | UnexpectedPatternForType Pattern Type
@@ -119,6 +144,9 @@ data TypeCheckerError
   | UnexpectedVariantType StellaIdent Type
   | TupleIndexOutOfBounds Integer Type
   | WrongArityMain Int
+  | ExceptionTypeNotDeclared
+  | IllegalExceptionTypeDeclaration
+  | IllegalExceptionVariantDeclaration
   | NonexhaustivePatternMatching [Pattern] Expr Type
   deriving (Eq, Ord, Read)
 
@@ -142,10 +170,38 @@ instance Show TypeCheckerError where
         ++ "\n"
         ++ "  for expression:\n    "
         ++ printTree expr
+    UnexpectedSubtype expr expected inferred ->
+      "ERROR_UNEXPECTED_SUBTYPE:\n"
+        ++ "  expected (sub)type:\n    "
+        ++ printTree expected
+        ++ "\n"
+        ++ "  but got type:\n    "
+        ++ printTree inferred
+        ++ "\n"
+        ++ "  for expression:\n    "
+        ++ printTree expr
+    UnexpectedSubtypeNoExpr expected inferred ->
+      "ERROR_UNEXPECTED_SUBTYPE:\n"
+        ++ "  expected (sub)type:\n    "
+        ++ printTree expected
+        ++ "\n"
+        ++ "  but got type:\n    "
+        ++ printTree inferred
+        ++ "\n"
+    ExceptionTypeNotDeclared ->
+      "ERROR_EXCEPTION_TYPE_NOT_DECLARED:\n  Exception thrown without preceding specification of excpetion type"
     AmbigousPatternType pat ->
       "ERROR_AMBIGUOUS_PATTERN_TYPE:\n  Can not infer type for pattern: " ++ printTree pat
+    AmbigousReferenceType expr ->
+      "ERROR_AMBIGUOUS_REFERENCE_TYPE:\n  Can not infer type for constant memory address: " ++ printTree expr
+    AmbigousPanicType expr ->
+      "ERROR_AMBIGUOUS_PANIC_TYPE:\n  Can not infer type for error-throwing expression: " ++ printTree expr
+    AmbigousThrowType expr ->
+      "ERROR_AMBIGUOUS_THROW_TYPE:\n  Can not infer type for error-throwing expression: " ++ printTree expr
     NotAFunction expr ->
       "ERROR_NOT_A_FUNCTION:\n  expression is not a function: " ++ printTree expr
+    NotAReference expr ->
+      "ERROR_NOT_A_REFERENCE:\n  expression is not a reference: " ++ printTree expr
     NotATuple expr ->
       "ERROR_NOT_A_TUPLE:\n  expression is not a tuple: " ++ printTree expr
     NotARecord expr ->
@@ -167,6 +223,10 @@ instance Show TypeCheckerError where
       "ERROR_UNEXPECTED_TUPLE:\n  expected non‑tuple type " ++ printTree t ++ " but got tuple: " ++ printTree expr
     UnexpectedRecord expr t ->
       "ERROR_UNEXPECTED_RECORD:\n  expected non‑record type " ++ printTree t ++ "  but got record: " ++ show expr
+    UnexpectedReference expr t ->
+      "ERROR_UNEXPECTED_REFERENCE:\n  expected non‑reference type " ++ printTree t ++ "  but got reference: " ++ show expr
+    UnexpectedMemoryAddress expr t ->
+      "ERROR_UNEXPECTED_MEMORY_ADDRESS:\n  expected non‑refernce type " ++ printTree t ++ "  but got memory address: " ++ printTree expr
     UnexpectedVariant expr t ->
       "ERROR_UNEXPECTED_VARIANT:\n  expected non‑variant type " ++ printTree t ++ "  but got variant: " ++ printTree expr
     UnexpectedDataForNullaryType label expr t ->
@@ -236,6 +296,12 @@ instance Show TypeCheckerError where
         ++ printTree e
         ++ "  of length "
         ++ show actualLength
+    ConflicitingExceptionDeclarations ->
+      "ERROR_CONFLICTING_EXCEPTION_DECLARATIONS: several declarations of exception type/variant found"
+    DuplicateExceptionType ->
+      "ERROR_DUPLICATE_EXCEPTION_TYPE: several declarations of exception type found"
+    DuplicateExceptionVariant name ->
+      "ERROR_DUPLICATE_EXCEPTION_VARIANT: several declarations of exception label " ++ printTree name ++ " found"
     DuplicateVariableLet name ->
       "ERROR_DUPLICATE_LET_BINDING:\n  duplicate variable in let:\n" ++ printTree name
     DuplicateVariablePattern name ->
@@ -296,10 +362,63 @@ instance Show TypeCheckerError where
         ++ printTree e
         ++ " of type "
         ++ printTree t
+    IllegalExceptionTypeDeclaration -> "ERROR_ILLEGAL_LOCAL_EXCEPTION_TYPE:\n"
+    IllegalExceptionVariantDeclaration -> "ERROR_ILLEGAL_LOCAL_EXCEPTION_VARIANT:\n"
 
 type TypeCheckerResult t = Either TypeCheckerError t
 
-type Context = [(StellaIdent, Type)]
+type Bindings = [(StellaIdent, Type)]
+
+data ExceptionType
+  = NoException
+  | KnownException Type
+  | OpenException [VariantFieldType]
+
+data Context = Context
+  { ctxBindings :: Bindings,
+    ctxException :: ExceptionType,
+    ctxAmbigiousisBottom :: Bool,
+    ctxSubtyping :: Bool
+  }
+
+contextEmpty :: ExceptionType -> Bool -> Bool -> Context
+contextEmpty = Context []
+
+contextLookup :: Context -> StellaIdent -> TypeCheckerResult Type
+contextLookup ctx name = case lookup name (ctxBindings ctx) of
+  Just t -> return t
+  Nothing -> Left $ UndefinedVariable name
+
+-- TODO: optics ???
+contextExtend :: Context -> Bindings -> Context
+contextExtend (Context bindings exc ab s) bindings' =
+  Context (bindings' ++ bindings) exc ab s
+
+contextCurrentException :: Context -> TypeCheckerResult Type
+contextCurrentException (Context _ e _ _) = case e of
+  NoException -> Left $ ExceptionTypeNotDeclared
+  KnownException t -> return t
+  OpenException variants -> return $ TypeVariant variants
+
+contextIsSuitable :: Context -> Type -> Type -> Bool
+contextIsSuitable ctx = if ctxSubtyping ctx then (<:) else (==)
+
+contextGenericError :: Context -> Expr -> Type -> Type -> TypeCheckerError
+contextGenericError ctx e infered expected =
+  if ctxSubtyping ctx
+    then UnexpectedSubtype e expected infered
+    else UnexpectedType e expected infered
+
+contextCheckIsSuitable :: Context -> Expr -> Type -> Type -> TypeCheckerResult ()
+contextCheckIsSuitable ctx e infered target =
+  unless (contextIsSuitable ctx infered target) (Left $ contextGenericError ctx e infered target)
+
+contextEnsureIsSuitable :: Context -> Expr -> Type -> TypeCheckerResult ()
+contextEnsureIsSuitable ctx e target = case ensure ctx e target of
+  Right () -> Right ()
+  Left _ -> do
+    infered <- infer ctx e
+    contextCheckIsSuitable ctx e infered target
 
 type FunctionSignature = (StellaIdent, Type)
 
@@ -307,27 +426,34 @@ extractFunctionSignature :: Decl -> TypeCheckerResult FunctionSignature
 extractFunctionSignature (DeclFun _ name params (SomeReturnType return_type) _ _ _) = Right (name, TypeFun [t | (AParamDecl _ t) <- params] return_type)
 extractFunctionSignature decl = Left $ UnsupportedDecl decl
 
-collectFuncDecls :: [Decl] -> TypeCheckerResult [FunctionSignature]
-collectFuncDecls decls = sequence $ extractFunctionSignature <$> decls
+collectFuncDecls :: [Decl] -> TypeCheckerResult Bindings
+collectFuncDecls decls = sequence $ extractFunctionSignature <$> filter isFunctionDecl decls
+  where
+    isFunctionDecl DeclFun {} = True
+    isFunctionDecl _ = False
 
-typeCheckFunction :: Context -> Decl -> TypeCheckerResult ()
-typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
+typeCheckFunction :: Bool -> Context -> Decl -> TypeCheckerResult ()
+typeCheckFunction _ ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
   ctxExtension <- paramsToContext params
-  let extendedCtx = ctxExtension ++ ctx
-  typecheckFunctions extendedCtx nested
+  let extendedCtx = contextExtend ctx ctxExtension
+  typecheckFunctions True extendedCtx nested
   nestedFunctionCtx <- collectFuncDecls nested
-  let bodyContext = nestedFunctionCtx ++ extendedCtx
+  let bodyContext = contextExtend extendedCtx nestedFunctionCtx
   validate'n'ensure'ctx bodyContext body return_type
-typeCheckFunction _ decl = Left $ UnsupportedDecl decl
+typeCheckFunction local _ (DeclExceptionType _) =
+  when local $ Left IllegalExceptionTypeDeclaration
+typeCheckFunction local _ (DeclExceptionVariant _ _) =
+  when local $ Left IllegalExceptionVariantDeclaration
+typeCheckFunction local _ decl = Left $ UnsupportedDecl decl
 
-typecheckFunctions :: Context -> [Decl] -> TypeCheckerResult ()
-typecheckFunctions ctx decls = do
+typecheckFunctions :: Bool -> Context -> [Decl] -> TypeCheckerResult ()
+typecheckFunctions local ctx decls = do
   signatures <- collectFuncDecls decls
   functionsCtx <- ensureNoDuplicates signatures
-  let extendedCtx = functionsCtx ++ ctx
-  sequence_ $ typeCheckFunction extendedCtx <$> decls
+  let extendedCtx = contextExtend ctx functionsCtx
+  sequence_ $ typeCheckFunction local extendedCtx <$> decls
   where
-    ensureNoDuplicates :: [FunctionSignature] -> TypeCheckerResult Context
+    ensureNoDuplicates :: [FunctionSignature] -> TypeCheckerResult Bindings
     ensureNoDuplicates signatures =
       case duplicateIn [name | (name, _) <- signatures] of
         Nothing -> Right signatures
@@ -339,14 +465,45 @@ data TCCfg = Cfg
   }
 
 extensionNames :: [Extension] -> [String]
-extensionNames ext_decls = [name | (AnExtension exts) <- ext_decls, (ExtensionName name) <- exts]
+extensionNames ext_decls =
+  let extensions = [name | (AnExtension exts) <- ext_decls, (ExtensionName name) <- exts]
+   in {- trace (show extensions) -} extensions
+
+-- returns ExceptionType for a program. As we know,
+-- open variant exception is just a fancy way for declaring
+-- simple (closed variant exception), since it does not work in baseline
+getExceptionType :: Program -> TypeCheckerResult ExceptionType
+getExceptionType (AProgram _ _ decls)
+  | null exceptionTypeDecls && null exceptionVariantDecls =
+    return NoException
+  | null exceptionVariantDecls && length exceptionTypeDecls /= 1 =
+    Left $ DuplicateExceptionType
+  | null exceptionVariantDecls =
+    let (DeclExceptionType t) = head exceptionTypeDecls
+     in return $ KnownException t
+  | null exceptionTypeDecls =
+    case duplicateIn [name | (DeclExceptionVariant name _) <- exceptionVariantDecls] of
+      Just name -> Left $ DuplicateExceptionVariant name
+      Nothing -> return $ OpenException [AVariantFieldType name (SomeTyping t) | (DeclExceptionVariant name t) <- exceptionVariantDecls]
+  | otherwise = Left $ ConflicitingExceptionDeclarations
+  where
+    isExceptionTypeDeclaration (DeclExceptionType _) = True
+    isExceptionTypeDeclaration _ = False
+    isExceptionVariantDeclaration (DeclExceptionVariant _ _) = True
+    isExceptionVariantDeclaration _ = False
+    exceptionTypeDecls = filter isExceptionTypeDeclaration decls
+    exceptionVariantDecls = filter isExceptionVariantDeclaration decls
 
 -- Entry point of type checker: checks the whole program
 typeCheck :: Program -> TypeCheckerResult ()
 typeCheck program@(AProgram _ extensions decls) = do
-  let cfg = let names = extensionNames extensions in Cfg ("ambiguous-type-as-bottom" `elem` names) ("structural-subtyping" `elem` names)
+  let exNames = extensionNames extensions
+  let ambitiosIsBottom = "#ambiguous-type-as-bottom" `elem` exNames
+  let subtypingAllowed = "#structural-subtyping" `elem` exNames
+  -- traceM ("Ambitious to bottom: " ++ show ambitiosIsBottom ++ ", Subtyping = " ++ show subtypingAllowed)
+  exceptionType <- getExceptionType program
   collectFuncDecls decls >>= ensureMainValid
-  typecheckFunctions [] decls
+  typecheckFunctions False (contextEmpty exceptionType ambitiosIsBottom subtypingAllowed) decls
   where
     ensureMainValid :: [FunctionSignature] -> TypeCheckerResult ()
     ensureMainValid decls =
@@ -366,17 +523,10 @@ duplicateIn = go S.empty
       | x `S.member` seen = Just x
       | otherwise = go (S.insert x seen) xs
 
-areEqualAsSets :: Ord a => [a] -> [a] -> Bool
-areEqualAsSets xs ys = S.fromList xs == S.fromList ys
-
-allEqual :: (Eq a) => [a] -> Bool
-allEqual [] = True
-allEqual (x : xs) = all (== x) xs
-
 -- Typechecking-specific utils
 
 -- Builds a context prefics based on function parameters description
-paramsToContext :: [ParamDecl] -> TypeCheckerResult Context
+paramsToContext :: [ParamDecl] -> TypeCheckerResult Bindings
 paramsToContext decls =
   case duplicateIn [name | (AParamDecl name t) <- decls] of
     Just name -> Left $ DuplicateFunctionParameterName name
@@ -395,9 +545,9 @@ extractRecordFieldType label fields = case lookup label [(name, t) | (ARecordFie
   (Just t) -> return t
 
 -- Ensures that records value have correct record fiedls
-exprSuitsRecordType :: [Binding] -> [RecordFieldType] -> TypeCheckerResult ()
-exprSuitsRecordType actual_bindings expected_bindings
-  | not (all (`elem` expected) actual) = Left $ UnexpectedFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
+exprSuitsRecordType :: Bool -> [Binding] -> [RecordFieldType] -> TypeCheckerResult ()
+exprSuitsRecordType subtypingEnabled actual_bindings expected_bindings
+  | not subtypingEnabled && not (all (`elem` expected) actual) = Left $ UnexpectedFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
   | not (all (`elem` actual) expected) = Left $ MissingFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
   | otherwise = return ()
   where
@@ -437,32 +587,12 @@ validateType t@(TypeVariant members) =
 validateType t = Right t
 
 -- Joins a contexts produced by several simultaneously matched patterns (e.g. in multivariable let or in PatternTuple)
-joinPatternContexts :: [Context] -> TypeCheckerResult Context
+joinPatternContexts :: [Bindings] -> TypeCheckerResult Bindings
 joinPatternContexts contexts =
   let result = concat contexts
    in case duplicateIn [name | (name, _) <- result] of
         Nothing -> return result
         Just duplicated -> Left $ DuplicateVariablePattern duplicated
-
--- Checks whether bunch of patterns covers all possible values of a type
--- Prerequisite: all patterns shall match the type (e.g. checked via patternContext function)
--- Legacy implementation, does not support structural patterns. vide isEchaustiveStructural
-isExhaustive :: Type -> [Pattern] -> Bool
-isExhaustive t@(TypeSum _ _) patterns =
-  any (isIrrefutable t) patterns || (any isPatternForInl patterns && any isPatternForInr patterns)
-  where
-    isPatternForInl (PatternInl (PatternVar _)) = True
-    isPatternForInl _ = False
-    isPatternForInr (PatternInr (PatternVar _)) = True
-    isPatternForInr _ = False
-isExhaustive t@(TypeVariant members) patterns =
-  any (isIrrefutable t) patterns || all (\member -> any (isPatternForVariantField member) patterns) members
-  where
-    isPatternForVariantField :: VariantFieldType -> Pattern -> Bool
-    isPatternForVariantField (AVariantFieldType label (SomeTyping _)) (PatternVariant label' (SomePatternData (PatternVar _))) = label == label'
-    isPatternForVariantField (AVariantFieldType label NoTyping) (PatternVariant label' NoPatternData) = label == label'
-    isPatternForVariantField _ _ = False
-isExhaustive t pts = any (isIrrefutable t) pts
 
 -- Pattern matching exhaustiveness check utils
 
@@ -476,6 +606,9 @@ isIrrefutable (TypeTuple types) (PatternTuple pats) =
 isIrrefutable (TypeRecord fields) (PatternRecord pats) =
   all (uncurry isIrrefutable) $ fromRight [] $ sequence [(,pat) <$> extractRecordFieldType name fields | (ALabelledPattern name pat) <- pats]
 isIrrefutable _ _ = False
+
+getRawIdent :: StellaIdent -> String
+getRawIdent (StellaIdent a) = a
 
 namesInPattern :: Pattern -> [StellaIdent]
 namesInPattern (PatternAsc pat _) = namesInPattern pat
@@ -494,9 +627,6 @@ namesInPattern (PatternInt _) = []
 namesInPattern (PatternSucc pat) = namesInPattern pat
 namesInPattern (PatternVar name) = [name]
 namesInPattern (PatternCastAs pat _) = namesInPattern pat
-
-getRawIdent :: StellaIdent -> String
-getRawIdent (StellaIdent a) = a
 
 -- Generalised representation of albebraical data type variant
 data Constructor a = Constructor
@@ -532,12 +662,14 @@ listConstructors t@(TypeVariant members) = [Constructor t (getRawIdent name) (op
     optionalTypingToArr NoTyping = []
 listConstructors t@(TypeTuple fields) = [Constructor t "tuple" fields]
 listConstructors t@(TypeRecord fields) = [Constructor t "tuple" [t | (ARecordFieldType _ t) <- fields]]
-listConstructors _ = error "Exhaustiveness check internal error" -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
+listConstructors t@(TypeTop) = [] -- This is wrong
+listConstructors t = error $ "Exhaustiveness check internal error " ++ printTree t -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
 
 -- Evaluates which constructor of known type is covered with known pattern. Nothing stands for all the constructors
 matchedConstructor :: Type -> Pattern -> Maybe (Constructor Pattern)
 matchedConstructor t (PatternVar _) = Nothing
 matchedConstructor t (PatternAsc p _) = matchedConstructor t p
+matchedConstructor t (PatternCastAs p t') = matchedConstructor t' p
 matchedConstructor TypeBool PatternTrue = Just $ Constructor TypeBool "true" []
 matchedConstructor TypeBool PatternFalse = Just $ Constructor TypeBool "false" []
 matchedConstructor TypeUnit PatternUnit = Just $ Constructor TypeUnit "unit" []
@@ -565,6 +697,7 @@ matchedConstructor t p = error $ "Exhaustiveness check internal error:\n  " ++ p
 -- TODO: rewrite Pattern Type with `Fix` to simplify recursive application of desugarPattern
 desugarPattern :: Pattern -> Pattern
 desugarPattern (PatternAsc p t) = PatternAsc (desugarPattern p) t
+desugarPattern (PatternCastAs p t) = PatternCastAs (desugarPattern p) t
 desugarPattern p@(PatternInt 0) = p
 desugarPattern (PatternInt n) = PatternSucc $ desugarPattern (PatternInt $ n - 1)
 desugarPattern (PatternSucc ch) = PatternSucc $ desugarPattern ch
@@ -612,11 +745,11 @@ allCovered rows (t : rest) =
     extendRow c [] = []
 
 -- Finds first non-expected type and returns an erorr
-findNonExpected :: Type -> [(Type, Expr)] -> TypeCheckerResult ()
-findNonExpected expected ((t, e) : rest) = do
-  when (t /= expected) $ Left $ UnexpectedType e expected t
-  findNonExpected expected rest
-findNonExpected expected [] = return ()
+findNonExpected :: Context -> Type -> [(Type, Expr)] -> TypeCheckerResult ()
+findNonExpected ctx expected ((t, e) : rest) = do
+  contextCheckIsSuitable ctx e t expected
+  findNonExpected ctx expected rest
+findNonExpected _ _ [] = return ()
 
 -- Checks whether structural pattern binding is exhaustive
 -- Prerequidite: patternContext does not emit error for any of patterns
@@ -625,8 +758,11 @@ isExhaustiveStructural t patterns = let rows = [[desugarPattern pat] | pat <- pa
 
 -- Produces the context which consists with binded names after matching expression of type `t`
 -- against specific pattern
-patternContext :: Pattern -> Type -> TypeCheckerResult Context
+patternContext :: Pattern -> Type -> TypeCheckerResult Bindings
 patternContext (PatternVar name) t = return [(name, t)]
+patternContext (PatternCastAs p ty) t = do
+  unless (ty <: t) (Left $ UnexpectedSubtypeNoExpr t ty)
+  patternContext p ty
 patternContext (PatternAsc p t') t = do
   -- unless (t' == t) (Left $ UnexpectedPatternForType p t')
   patternContext p t
@@ -669,7 +805,7 @@ patternContext p@(PatternVariant label NoPatternData) t@(TypeVariant members) = 
 patternContext p t = Left $ UnexpectedPatternForType p t
 
 -- Just infer + patternContext for PatternBinding
-patternBindingContext :: Context -> PatternBinding -> TypeCheckerResult Context
+patternBindingContext :: Context -> PatternBinding -> TypeCheckerResult Bindings
 patternBindingContext ctx (APatternBinding pattern expr) = do
   t <- infer ctx expr
   res <- patternContext pattern t
@@ -682,8 +818,51 @@ ensureNoRecordDuplicateFileds bindings =
     Just ident -> Left $ DuplicateRecordFields ident $ Record bindings
     Nothing -> return ()
 
+-- Subtyping utils
+(<:) :: Type -> Type -> Bool
+(TypeFun lhs'args lhs'ret) <: (TypeFun rhs'args rhs'ret) =
+  length lhs'args == length rhs'args
+    && all (uncurry (<:)) (zip rhs'args lhs'args)
+    && lhs'ret <: rhs'ret
+(TypeRecord lhs'fields) <: (TypeRecord rhs'fields) =
+  all (`elem` lhs'names) rhs'names
+    && all (uncurry (<:) . getBothTypes) rhs'names
+  where
+    lhs'names = [name | (ARecordFieldType name _) <- lhs'fields]
+    rhs'names = [name | (ARecordFieldType name _) <- rhs'fields]
+    getBothTypes :: StellaIdent -> (Type, Type)
+    getBothTypes name = case (,) <$> extractRecordFieldType name lhs'fields <*> extractRecordFieldType name rhs'fields of
+      Left _ -> error "Internal typechecker error"
+      Right ts -> ts
+(TypeTuple lhs) <: (TypeTuple rhs) =
+  length lhs == length rhs
+    && all (uncurry (<:)) (zip lhs rhs)
+(TypeSum ll lr) <: (TypeSum rl rr) =
+  ll <: rl && lr <: rr
+(TypeList lhs) <: (TypeList rhs) =
+  lhs <: rhs
+(TypeRef lhs) <: (TypeRef rhs) = lhs <: rhs && rhs <: lhs
+(TypeVariant lhs'fields) <: (TypeVariant rhs'fields) =
+  all (`elem` rhs'names) lhs'names
+    && all (uncurry (<::) . getBothTypes) lhs'names
+  where
+    lhs'names = [name | (AVariantFieldType name _) <- lhs'fields]
+    rhs'names = [name | (AVariantFieldType name _) <- rhs'fields]
+    getBothTypes :: StellaIdent -> (OptionalTyping, OptionalTyping)
+    getBothTypes name = case (,) <$> extractVariantMemberType name lhs'fields <*> extractVariantMemberType name rhs'fields of
+      Left _ -> error "Internal typechecker error"
+      Right ts -> ts
+    (<::) :: OptionalTyping -> OptionalTyping -> Bool
+    NoTyping <:: NoTyping = True
+    SomeTyping l <:: SomeTyping r = l <: r
+    _ <:: _ = False
+TypeBottom <: _ = True
+_ <: TypeTop = True
+l <: r = l == r
+
 -- inference function: calculates type of expression based on its structure and context
 -- Context contains information of externally defined variables types, with respect to possible shadowing
+-- TODO: Monad reader for configs ???
 infer :: Context -> Expr -> TypeCheckerResult Type
 infer _ ConstTrue = return TypeBool
 infer _ ConstFalse = return TypeBool
@@ -695,7 +874,7 @@ infer ctx (If c t e) = do
 infer ctx (Abstraction params body) = do
   _ <- paramsToContext params
   sequence_ $ validateType <$> [t | (AParamDecl _ t) <- params]
-  return_type <- infer ([(name, t) | (AParamDecl name t) <- params] ++ ctx) body
+  return_type <- infer (contextExtend ctx [(name, t) | (AParamDecl name t) <- params]) body
   return $ TypeFun [t | (AParamDecl name t) <- params] return_type
 infer ctx e@(Application callee args) = do
   callee_type <- infer ctx callee
@@ -717,10 +896,8 @@ infer ctx (NatRec num init step) = do
   t <- infer ctx init
   ensure ctx step (TypeFun [TypeNat] $ TypeFun [t] t)
   return t
-infer ctx (Var name) = do
-  case lookup name ctx of
-    Nothing -> Left $ UndefinedVariable name
-    (Just t) -> return t
+infer ctx (Var name) =
+  contextLookup ctx name
 infer _ ConstUnit = return TypeUnit
 infer ctx (Tuple elems) = TypeTuple <$> sequence (infer ctx <$> elems)
 infer ctx (DotTuple tuple index) = do
@@ -750,7 +927,7 @@ infer ctx (Let bindings body) = do
     Nothing -> do
       patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
       patternsCtx <- joinPatternContexts patternCtxs
-      infer (patternsCtx ++ ctx) body
+      infer (contextExtend ctx patternsCtx) body
 infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
   let bindedNames = namesInPattern pattern
   case duplicateIn bindedNames of
@@ -758,34 +935,48 @@ infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
     Nothing -> do
       ctx' <- patternContext pattern t
       unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
-      let extendedCtx = ctx' ++ ctx
+      let extendedCtx = contextExtend ctx ctx'
       ensure extendedCtx expr t
       infer extendedCtx body
 infer ctx (LetRec [APatternBinding pattern expr] body) = Left $ AmbigousPatternType pattern
 infer ctx (LetRec _ body) = Left $ UnsupportedConstruction "letrec with many bindings"
-infer ctx (TypeAsc e t) = do
-  validateType t
-  ensure ctx e t
-  return t
-infer ctx (Inl e) = Left AmbigousSumType
-infer ctx (Inr e) = Left AmbigousSumType
+infer ctx (TypeAsc e t) =
+  do
+    validateType t
+    ensure ctx e t
+    return t
+infer ctx (Inl e) =
+  if ctxAmbigiousisBottom ctx
+    then do
+      t <- infer ctx e
+      return $ TypeSum t TypeBottom
+    else Left AmbigousSumType
+infer ctx (Inr e) =
+  if ctxAmbigiousisBottom ctx
+    then do
+      t <- infer ctx e
+      return $ TypeSum TypeBottom t
+    else Left AmbigousSumType
 infer ctx (Match e []) = Left EmptyMatch
 infer ctx (Match e cases@(c : cs)) = do
   t <- infer ctx e
   let patterns = [pattern | (AMatchCase pattern _) <- cases]
-  branches_types <- sequence [patternContext pattern t >>= (\ctx' -> infer (ctx' ++ ctx) b) | (AMatchCase pattern b) <- cases]
+  branches_types <- sequence [patternContext pattern t >>= (\ctx' -> infer (contextExtend ctx ctx') b) | (AMatchCase pattern b) <- cases]
   let expected_type = head branches_types
   let rest_types = tail branches_types
   let rest_exprs = [b | (AMatchCase pattern b) <- cs]
-  findNonExpected expected_type $ zip rest_types rest_exprs
+  findNonExpected ctx expected_type $ zip rest_types rest_exprs
   if not (isExhaustiveStructural t patterns)
     then Left $ NonexhaustivePatternMatching patterns e t
     else return expected_type
-infer ctx (List []) = Left AmbigousListType
+infer ctx (List []) =
+  if ctxAmbigiousisBottom ctx
+    then return $ TypeList TypeBottom
+    else Left AmbigousListType
 infer ctx (List exprs@(h : t)) = do
   head_type <- infer ctx h
   tails_types <- sequence $ infer ctx <$> t
-  findNonExpected head_type $ zip tails_types t
+  findNonExpected ctx head_type $ zip tails_types t
   return $ TypeList head_type
 infer ctx (ConsList head tail) = do
   t <- infer ctx head
@@ -806,7 +997,17 @@ infer ctx (IsEmpty list) = do
   case t of
     (TypeList e) -> return TypeBool
     _ -> Left $ NotAList list
-infer ctx (Variant label (SomeExprData expr)) = Left AmbigousVariantType
+infer ctx (Variant label (SomeExprData expr)) =
+  if ctxSubtyping ctx
+    then do
+      t <- infer ctx expr
+      return $ TypeVariant [AVariantFieldType label (SomeTyping t)]
+    else Left AmbigousVariantType
+infer ctx (Variant label NoExprData) =
+  if ctxSubtyping ctx
+    then do
+      return $ TypeVariant [AVariantFieldType label NoTyping]
+    else Left AmbigousVariantType
 infer ctx e@(Fix f) = do
   arrow <- infer ctx f
   case arrow of
@@ -816,6 +1017,54 @@ infer ctx e@(Fix f) = do
         else Left $ UnexpectedType f (TypeFun [ret] ret) arrow
     (TypeFun args _) -> Left $ MismatchedArgumentsNumber 1 (length args) e
     _ -> Left $ NotAFunction f
+infer ctx (Sequence former latter) = do
+  ensure ctx former TypeUnit
+  infer ctx latter
+infer ctx (Ref expr) = do
+  t <- infer ctx expr
+  return $ TypeRef t
+infer ctx (Deref expr) = do
+  ref_t <- infer ctx expr
+  case ref_t of
+    TypeRef t -> return t
+    t' -> Left $ NotAReference expr
+infer ctx (Assign ref expr) = do
+  ref_t <- infer ctx ref
+  case ref_t of
+    TypeRef t -> do
+      ensure ctx expr t
+      return TypeUnit
+    t' -> Left $ NotAReference ref
+infer ctx e@(ConstMemory _) = Left $ AmbigousReferenceType e -- TODO: add memory typing ???
+infer ctx e@Panic =
+  if ctxAmbigiousisBottom ctx
+    then return TypeBottom
+    else Left $ AmbigousPanicType e
+infer ctx e@(Throw exception) = do
+  exceptionType <- contextCurrentException ctx
+  ensure ctx exception exceptionType
+  if ctxAmbigiousisBottom ctx
+    then return TypeBottom
+    else Left $ AmbigousThrowType e
+infer ctx (TryCatch s p e) = do
+  t <- infer ctx s
+  exc <- contextCurrentException ctx
+  bindings <- patternContext p exc
+  let ctx' = contextExtend ctx bindings
+  ensure ctx' e t
+  return t
+infer ctx (TryWith s e) = do
+  t <- infer ctx s
+  ensure ctx e t
+  return t
+infer ctx e@(TryCastAs expr ty pattern success fail) = do
+  t <- infer ctx expr
+  unless (ty <: t) (Left $ UnexpectedSubtypeNoExpr t ty)
+  ctx' <- patternContext pattern ty
+  unless (isIrrefutable ty pattern) (Left $ NonexhaustivePatternMatching [pattern] expr ty)
+  t' <- infer (contextExtend ctx ctx') success
+  ensure ctx fail t'
+  return t'
 infer _ e = Left $ UnsupportedExpression e
 
 -- verification function: ensures that expression can be typed with the specific type
@@ -823,9 +1072,7 @@ infer _ e = Left $ UnsupportedExpression e
 -- Default case is type inference and comparasion
 ensure :: Context -> Expr -> Type -> TypeCheckerResult ()
 ensure _ ConstTrue TypeBool = return ()
-ensure _ ConstTrue expected = Left $ UnexpectedType ConstTrue expected TypeBool
 ensure _ ConstFalse TypeBool = return ()
-ensure _ ConstFalse expected = Left $ UnexpectedType ConstFalse expected TypeBool
 ensure ctx (If c t e) expected = do
   ensure ctx c TypeBool
   ensure ctx t expected
@@ -836,48 +1083,78 @@ ensure ctx e@(Abstraction params body) (TypeFun expected_args return_type) = do
   if length expected_args /= length actual_args
     then Left $ UnexpectedArgumentsNumberInLambda (length expected_args) (length actual_args) e
     else
-      if actual_args == expected_args
-        then ensure ([(name, t) | (AParamDecl name t) <- params] ++ ctx) body return_type
+      if all (uncurry $ flip $ contextIsSuitable ctx) $ zip actual_args expected_args
+        then ensure (contextExtend ctx [(name, t) | (AParamDecl name t) <- params]) body return_type
         else
           Left $
             UnexpectedTypeForParameter
               expected_args
               actual_args
-ensure ctx e@(Abstraction _ _) t = Left $ UnexpectedLambda e t
+ensure ctx e@(Abstraction _ _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedLambda e t)
+  | otherwise = Left $ UnexpectedLambda e t
 ensure _ (ConstInt _) TypeNat = return ()
-ensure _ e@(ConstInt _) expected = Left $ UnexpectedType e expected TypeNat
 ensure ctx (NatRec num init step) expected = do
   ensure ctx num TypeNat
   ensure ctx init expected
   ensure ctx step (TypeFun [TypeNat] $ TypeFun [expected] expected)
 ensure _ ConstUnit TypeUnit = return ()
-ensure _ ConstUnit expected = Left $ UnexpectedType ConstUnit expected TypeUnit
 ensure ctx t@(Tuple elems) e@(TypeTuple tuple_elems)
   | length elems /= length tuple_elems = Left $ UnexpectedTupleLength (length tuple_elems) (length elems) e t
   | otherwise = sequence_ [ensure ctx e t | (e, t) <- zip elems tuple_elems]
-ensure ctx e@(Tuple elems) t = Left $ UnexpectedTuple e t
+ensure ctx e@(Tuple _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedTuple e t)
+  | otherwise = Left $ UnexpectedTuple e t
 ensure ctx (Record bindings) t@(TypeRecord fields) = do
   _ <- validateType t
   ensureNoRecordDuplicateFileds bindings
-  exprSuitsRecordType bindings fields
-  sequence_ [extractRecordFieldType name fields >>= ensure ctx e | (ABinding name e) <- bindings]
-ensure ctx e@(Record _) t = Left $ UnexpectedRecord e t
+  exprSuitsRecordType (ctxSubtyping ctx) bindings fields
+  sequence_ [ensureFieldType name e fields | (ABinding name e) <- bindings]
+  where
+    ensureFieldType name e fiedls = case extractRecordFieldType name fields of
+      Left _ -> void (infer ctx e)
+      Right ty -> ensure ctx e ty
+ensure ctx e@(Record _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedRecord e t)
+  | otherwise = Left $ UnexpectedRecord e t
 ensure ctx (Inl e) (TypeSum l _) = ensure ctx e l
-ensure ctx e@(Inl _) t = Left $ UnexpectedInjection e t
+ensure ctx e@(Inl _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedInjection e t)
+  | otherwise = Left $ UnexpectedInjection e t
 ensure ctx (Inr e) (TypeSum _ r) = ensure ctx e r
-ensure ctx e@(Inr _) t = Left $ UnexpectedInjection e t
+ensure ctx e@(Inr _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedInjection e t)
+  | otherwise = Left $ UnexpectedInjection e t
 ensure ctx (Match e cases@(c : cs)) expected = do
   t <- infer ctx e
   let patterns = [pattern | (AMatchCase pattern _) <- cases]
-  sequence_ [patternContext pattern t >>= (\ctx' -> ensure (ctx' ++ ctx) b expected) | (AMatchCase pattern b) <- cases]
+  sequence_ [patternContext pattern t >>= (\ctx' -> ensure (contextExtend ctx ctx') b expected) | (AMatchCase pattern b) <- cases]
   unless (isExhaustiveStructural t patterns) $ Left $ NonexhaustivePatternMatching patterns e t
 ensure ctx (List []) (TypeList _) = return ()
 ensure ctx (List exprs) (TypeList expected) = sequence_ $ [ensure ctx expr expected | expr <- exprs]
-ensure ctx e@(List _) t = Left $ UnexpectedList e t
+ensure ctx e@(List _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedList e t)
+  | otherwise = Left $ UnexpectedList e t
 ensure ctx (ConsList head tail) t@(TypeList expected) = do
   ensure ctx head expected
   ensure ctx tail t
-ensure ctx e@(ConsList head tail) t = Left $ UnexpectedList e t
+ensure ctx e@(ConsList _ _) t
+  | ctxSubtyping ctx = do
+    t' <- infer ctx e
+    unless (t' <: t) (Left $ UnexpectedList e t)
+  | otherwise = Left $ UnexpectedList e t
 ensure ctx (Head list) expected = ensure ctx list (TypeList expected)
 ensure ctx (Tail list) expected@(TypeList _) = ensure ctx list expected
 ensure ctx e@(Variant label (SomeExprData expr)) t@(TypeVariant members) = do
@@ -892,11 +1169,11 @@ ensure ctx (Let bindings body) t = do
     Nothing -> do
       patternCtxs <- sequence $ patternBindingContext ctx <$> bindings
       patternsCtx <- joinPatternContexts patternCtxs
-      ensure (patternsCtx ++ ctx) body t
+      ensure (contextExtend ctx patternsCtx) body t
 ensure ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) t' = do
   ctx' <- patternContext pattern t
   unless (isIrrefutable t pattern) (Left $ NonexhaustivePatternMatching [pattern] expr t)
-  let extendedCtx = ctx' ++ ctx
+  let extendedCtx = contextExtend ctx ctx'
   ensure extendedCtx expr t
   ensure extendedCtx body t'
 ensure ctx (LetRec [APatternBinding pattern expr] body) _ = Left $ AmbigousPatternType pattern
@@ -913,11 +1190,47 @@ ensure ctx (Fix f) expected = case ensure ctx f (TypeFun [expected] expected) of
     Right i@(TypeFun _ _) -> Left $ UnexpectedType f (TypeFun [expected] expected) i
     Right e -> Left $ NotAFunction f
   res -> res
+ensure ctx (Sequence former latter) t = do
+  ensure ctx former TypeUnit
+  ensure ctx latter t
+ensure ctx (Ref expr) (TypeRef t) = do
+  ensure ctx expr t
+ensure ctx e@(Ref expr) t = Left $ UnexpectedReference e t
+ensure ctx e@(Deref expr) t =
+  if ctxSubtyping ctx
+    then case ensure ctx expr (TypeRef t) of
+      Right () -> Right ()
+      Left _ -> do
+        infered <- infer ctx expr
+        case infered of
+          TypeRef t' -> contextCheckIsSuitable ctx expr t' t
+          _ -> Left $ NotAReference expr
+    else ensure ctx expr (TypeRef t)
+ensure ctx e@(ConstMemory _) (TypeRef _) = return () -- TODO: where can I find
+ensure ctx e@(ConstMemory _) t = Left $ UnexpectedMemoryAddress e t
+ensure ctx Panic t = return ()
+ensure ctx e@(Throw exception) _ = do
+  exceptionType <- contextCurrentException ctx
+  ensure ctx exception exceptionType
+ensure ctx (TryCatch s p e) t = do
+  ensure ctx s t
+  exc <- contextCurrentException ctx
+  bindings <- patternContext p exc
+  let ctx' = contextExtend ctx bindings
+  ensure ctx' e t
+ensure ctx (TryWith s e) t = do
+  ensure ctx s t
+  ensure ctx e t
+ensure ctx e@(TryCastAs expr ty pattern success fail) t = do
+  t' <- infer ctx expr
+  unless (ty <: t') (Left $ UnexpectedSubtypeNoExpr t' ty)
+  ctx' <- patternContext pattern ty
+  unless (isIrrefutable ty pattern) (Left $ NonexhaustivePatternMatching [pattern] expr ty)
+  ensure (contextExtend ctx ctx') success t
+  ensure ctx fail t
 ensure ctx expr expected = do
   infered <- infer ctx expr
-  if expected == infered
-    then return ()
-    else Left $ UnexpectedType expr expected infered
+  contextCheckIsSuitable ctx expr infered expected
 
 -- validate target + ensure
 validate'n'ensure :: Context -> Expr -> Type -> TypeCheckerResult ()
@@ -928,5 +1241,5 @@ validate'n'ensure ctx e t = do
 -- validate context + validate target + ensure
 validate'n'ensure'ctx :: Context -> Expr -> Type -> TypeCheckerResult ()
 validate'n'ensure'ctx ctx e t = do
-  sequence_ $ validateType . snd <$> ctx
+  sequence_ $ validateType . snd <$> ctxBindings ctx
   validate'n'ensure ctx e t

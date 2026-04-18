@@ -1,0 +1,15 @@
+language core;
+
+extend with
+ #variants, 
+ #let-bindings,
+ #exceptions, 
+ #structural-subtyping,
+ #open-variant-exceptions,
+ #sum-types;
+extend with #lists;
+extend with #top-type;
+
+fn main(n : Nat) -> Top {
+  return inl(n)
+}

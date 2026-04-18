@@ -1,0 +1,14 @@
+language core;
+
+extend with
+ #variants, 
+ #let-bindings,
+ #exceptions, 
+ #structural-subtyping,
+ #open-variant-exceptions,
+ #ambiguous-type-as-bottom;
+extend with #lists;
+
+fn main(n : Nat) -> [Nat] {
+  return (let x = [] in x)
+}

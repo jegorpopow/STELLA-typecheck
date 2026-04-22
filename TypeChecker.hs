@@ -8,7 +8,6 @@ import Data.List (intercalate, nub, (\\))
 import Data.Maybe (fromJust, isNothing)
 import qualified Data.Set as S
 import Debug.Trace (trace, traceM)
-import Language.Haskell.TH (Con)
 import Syntax.Abs
   ( Binding (ABinding),
     Decl (DeclExceptionType, DeclExceptionVariant, DeclFun),
@@ -50,7 +49,8 @@ import Syntax.Abs
         Tuple,
         TypeAsc,
         Var,
-        Variant
+        Variant, 
+        TypeCast
       ),
     ExprData (NoExprData, SomeExprData),
     Extension (AnExtension),
@@ -122,7 +122,7 @@ data TypeCheckerError
   | UnsupportedDecl Decl
   | UnsupportedPattern Pattern
   | UnsupportedConstruction String
-  | MissingFields [StellaIdent] [StellaIdent] Expr Type
+  | MissingFields [StellaIdent] [StellaIdent] Type
   | UnexpectedFields [StellaIdent] [StellaIdent] Expr Type
   | EmptyMatch
   | UnexpectedLambda Expr Type
@@ -133,7 +133,8 @@ data TypeCheckerError
   | UnexpectedMemoryAddress Expr Type
   | UnexpectedList Expr Type
   | UnexpectedVariant Expr Type
-  | UnexpectedPatternForType Pattern Type
+  | -- | UnexpectedVariantName StellaIdent Type
+    UnexpectedPatternForType Pattern Type
   | MismatchedArgumentsNumber Int Int Expr
   | UnexpectedNonNullaryPattern StellaIdent Pattern Type
   | UnexpectedNullaryPattern StellaIdent Pattern Type
@@ -236,7 +237,7 @@ instance Show TypeCheckerError where
       "ERROR_UNEXPECTED_LIST:\n  expected non‑list type " ++ printTree t ++ "  but got list: " ++ printTree expr
     UnexpectedInjection expr t ->
       "ERROR_UNEXPECTED_INJECTION:\n  expected non‑sum type" ++ printTree t ++ "  but got injection: " ++ printTree expr
-    MissingFields expected actual e t ->
+    MissingFields expected actual t ->
       let missing = expected \\ actual
        in "ERROR_MISSING_RECORD_FIELDS:\n"
             ++ "  missing fields: "
@@ -248,8 +249,6 @@ instance Show TypeCheckerError where
             ++ "  actual fields: "
             ++ intercalate ", " (map printTree actual)
             ++ "\n"
-            ++ "  in value"
-            ++ printTree e
             ++ "  of type"
             ++ printTree t
     UnexpectedNonNullaryPattern label pat t ->
@@ -320,7 +319,7 @@ instance Show TypeCheckerError where
     AmbigousListType ->
       "ERROR_AMBIGUOUS_LIST_TYPE:\n  ambiguous list type (cannot determine type of list)"
     UnsupportedExpression expr ->
-      "ERROR_UNSUPPORTED_EXPRESSION:\n  unsupported expression: " ++ printTree expr
+      "ERROR_UNSUPPORTED_EXPRESSION:\n  unsupported expression: " ++ show expr
     UnsupportedDecl decl ->
       "ERROR_UNSUPPORTED_DECL:\n  unsupported declaration: " ++ printTree decl
     UnsupportedPattern pat ->
@@ -362,7 +361,7 @@ instance Show TypeCheckerError where
         ++ " of type "
         ++ printTree t
     IllegalExceptionTypeDeclaration -> "ERROR_ILLEGAL_LOCAL_EXCEPTION_TYPE:\n"
-    IllegalExceptionVariantDeclaration -> "ERROR_ILLEGAL_LOCAL_EXCEPTION_VARIANT:\n"
+    IllegalExceptionVariantDeclaration -> "ERROR_ILLEGAL_LOCAL_OPEN_VARIANT_EXCEPTION:\n"
 
 type TypeCheckerResult t = Either TypeCheckerError t
 
@@ -409,8 +408,9 @@ contextGenericError ctx e infered expected =
     else UnexpectedType e expected infered
 
 contextCheckIsSuitable :: Context -> Expr -> Type -> Type -> TypeCheckerResult ()
-contextCheckIsSuitable ctx e infered target =
-  unless (contextIsSuitable ctx infered target) (Left $ contextGenericError ctx e infered target)
+contextCheckIsSuitable ctx e infered target
+  | ctxSubtyping ctx = ensureSubtyping (Just e) infered target
+  | otherwise = unless (infered == target) $ Left $ UnexpectedType e target infered
 
 contextEnsureIsSuitable :: Context -> Expr -> Type -> TypeCheckerResult ()
 contextEnsureIsSuitable ctx e target = case ensure ctx e target of
@@ -547,7 +547,7 @@ extractRecordFieldType label fields = case lookup label [(name, t) | (ARecordFie
 exprSuitsRecordType :: Bool -> [Binding] -> [RecordFieldType] -> TypeCheckerResult ()
 exprSuitsRecordType subtypingEnabled actual_bindings expected_bindings
   | not subtypingEnabled && not (all (`elem` expected) actual) = Left $ UnexpectedFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
-  | not (all (`elem` actual) expected) = Left $ MissingFields expected actual (Record actual_bindings) (TypeRecord expected_bindings)
+  | not (all (`elem` actual) expected) = Left $ MissingFields expected actual (TypeRecord expected_bindings)
   | otherwise = return ()
   where
     actual = [name | (ABinding name _) <- actual_bindings]
@@ -859,6 +859,57 @@ TypeBottom <: _ = True
 _ <: TypeTop = True
 l <: r = l == r
 
+subtypingError :: Maybe Expr -> Type -> Type -> TypeCheckerError
+subtypingError Nothing a b = UnexpectedSubtypeNoExpr a b
+subtypingError (Just e) a b = UnexpectedSubtype e a b
+
+-- a <: b <=> ensureCorrectSubtyping a b === return ()
+ensureSubtyping :: Maybe Expr -> Type -> Type -> TypeCheckerResult ()
+ensureSubtyping e l@(TypeFun lhs'args lhs'ret) r@(TypeFun rhs'args rhs'ret) = do
+  unless (length lhs'args == length rhs'args) (Left $ subtypingError e r l)
+  sequence_ $ uncurry (ensureSubtyping Nothing) <$> zip rhs'args lhs'args
+  ensureSubtyping Nothing lhs'ret rhs'ret
+ensureSubtyping e l@(TypeRecord lhs'fields) r@(TypeRecord rhs'fields) = do
+  unless (all (`elem` lhs'names) rhs'names) $ Left $ MissingFields lhs'names rhs'names r
+  sequence_ $ uncurry (ensureSubtyping Nothing) . getBothTypes <$> rhs'names
+  where
+    lhs'names = [name | (ARecordFieldType name _) <- lhs'fields]
+    rhs'names = [name | (ARecordFieldType name _) <- rhs'fields]
+    getBothTypes :: StellaIdent -> (Type, Type)
+    getBothTypes name = case (,) <$> extractRecordFieldType name lhs'fields <*> extractRecordFieldType name rhs'fields of
+      Left _ -> error "Internal typechecker error"
+      Right ts -> ts
+ensureSubtyping e l@(TypeTuple lhs) r@(TypeTuple rhs) = do
+  unless (length lhs == length rhs) $ Left $ subtypingError e r l
+  sequence_ $ uncurry (ensureSubtyping Nothing) <$> zip lhs rhs
+ensureSubtyping _ (TypeSum ll lr) (TypeSum rl rr) = do
+  ensureSubtyping Nothing ll rl
+  ensureSubtyping Nothing lr rr
+ensureSubtyping _ (TypeList lhs) (TypeList rhs) = do
+  ensureSubtyping Nothing lhs rhs
+ensureSubtyping e (TypeRef lhs) (TypeRef rhs) = do
+  ensureSubtyping Nothing lhs rhs
+  ensureSubtyping Nothing rhs lhs
+ensureSubtyping e (TypeVariant lhs'fields) r@(TypeVariant rhs'fields) = do
+  unless (all (`elem` rhs'names) lhs'names) $ Left $ UnexpectedVariantType (head $ lhs'names \\ rhs'names) r
+  sequence_ $ uncurry ensureSubtypingOptional . getBothTypes <$> lhs'names
+  where
+    lhs'names = [name | (AVariantFieldType name _) <- lhs'fields]
+    rhs'names = [name | (AVariantFieldType name _) <- rhs'fields]
+    getBothTypes :: StellaIdent -> (OptionalTyping, OptionalTyping)
+    getBothTypes name = case (,) <$> extractVariantMemberType name lhs'fields <*> extractVariantMemberType name rhs'fields of
+      Left _ -> error "Internal typechecker error"
+      Right ts -> ts
+    ensureSubtypingOptional :: OptionalTyping -> OptionalTyping -> TypeCheckerResult ()
+    ensureSubtypingOptional NoTyping NoTyping = return ()
+    ensureSubtypingOptional (SomeTyping l) (SomeTyping r) = ensureSubtyping Nothing l r
+    ensureSubtypingOptional (SomeTyping l) NoTyping = undefined -- Not supported
+    ensureSubtypingOptional NoTyping (SomeTyping l) = undefined -- Not supprted
+ensureSubtyping _ TypeBottom _ = return ()
+ensureSubtyping _ _ TypeTop = return ()
+ensureSubtyping e l r = do
+  unless (l == r) $ Left $ subtypingError e r l
+
 -- inference function: calculates type of expression based on its structure and context
 -- Context contains information of externally defined variables types, with respect to possible shadowing
 -- TODO: Monad reader for configs ???
@@ -1056,9 +1107,11 @@ infer ctx (TryWith s e) = do
   t <- infer ctx s
   ensure ctx e t
   return t
+infer ctx (TypeCast expr ty) = do 
+  _ <- infer ctx expr
+  return ty 
 infer ctx e@(TryCastAs expr ty pattern success fail) = do
   t <- infer ctx expr
-  unless (ty <: t) (Left $ UnexpectedSubtypeNoExpr t ty)
   ctx' <- patternContext pattern ty
   unless (isIrrefutable ty pattern) (Left $ NonexhaustivePatternMatching [pattern] expr ty)
   t' <- infer (contextExtend ctx ctx') success
@@ -1082,13 +1135,18 @@ ensure ctx e@(Abstraction params body) (TypeFun expected_args return_type) = do
   if length expected_args /= length actual_args
     then Left $ UnexpectedArgumentsNumberInLambda (length expected_args) (length actual_args) e
     else
-      if all (uncurry $ flip $ contextIsSuitable ctx) $ zip actual_args expected_args
-        then ensure (contextExtend ctx [(name, t) | (AParamDecl name t) <- params]) body return_type
+      if ctxSubtyping ctx
+        then do
+          sequence_ $ uncurry (ensureSubtyping Nothing) <$> zip expected_args actual_args
+          ensure (contextExtend ctx [(name, t) | (AParamDecl name t) <- params]) body return_type
         else
-          Left $
-            UnexpectedTypeForParameter
-              expected_args
-              actual_args
+          if all (uncurry $ flip $ contextIsSuitable ctx) $ zip actual_args expected_args
+            then ensure (contextExtend ctx [(name, t) | (AParamDecl name t) <- params]) body return_type
+            else
+              Left $
+                UnexpectedTypeForParameter
+                  expected_args
+                  actual_args
 ensure ctx e@(Abstraction _ _) t
   | ctxSubtyping ctx = do
     t' <- infer ctx e
@@ -1222,11 +1280,14 @@ ensure ctx (TryWith s e) t = do
   ensure ctx e t
 ensure ctx e@(TryCastAs expr ty pattern success fail) t = do
   t' <- infer ctx expr
-  unless (ty <: t') (Left $ UnexpectedSubtypeNoExpr t' ty)
+  -- unless (ty <: t') (Left $ UnexpectedSubtypeNoExpr t' ty)
   ctx' <- patternContext pattern ty
   unless (isIrrefutable ty pattern) (Left $ NonexhaustivePatternMatching [pattern] expr ty)
   ensure (contextExtend ctx ctx') success t
   ensure ctx fail t
+ensure ctx e@(TypeCast expr ty) t = do 
+  _ <- infer ctx expr
+  contextCheckIsSuitable ctx e ty t
 ensure ctx expr expected = do
   infered <- infer ctx expr
   contextCheckIsSuitable ctx expr infered expected

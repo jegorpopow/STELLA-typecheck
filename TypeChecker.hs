@@ -2,7 +2,6 @@
 
 module Syntax.TypeChecker where
 
-import Cmm (Section)
 import Control.Monad (unless, void, when)
 import Data.Either (fromLeft, fromRight)
 import Data.List (intercalate, nub, (\\))

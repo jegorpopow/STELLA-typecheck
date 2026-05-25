@@ -11,7 +11,7 @@ import Data.IORef (IORef, newIORef)
 import Data.List (elemIndex, intercalate, nub, (\\))
 import Data.Maybe (fromJust, isJust, isNothing, mapMaybe)
 import qualified Data.Set as S
-import Debug.Trace (trace, traceM, traceStack)
+import Debug.Trace (trace, traceM)
 import GHC.IO (unsafePerformIO)
 import Language.Haskell.TH (Con)
 import Syntax.Abs
@@ -134,6 +134,7 @@ data TypeCheckerError
   | IncorrectNumberOfTypeArguments Type [Type]
   | UndefinedTypeVariable StellaIdent
   | InfiniteType Type Type
+  | DuplicateTypeParameter StellaIdent
   deriving (Eq, Ord, Read)
 
 instance Show TypeCheckerError where
@@ -336,6 +337,10 @@ instance Show TypeCheckerError where
         ++ "  equals"
         ++ printTree b
         ++ "  found"
+    DuplicateTypeParameter name ->
+      "ERROR_DUPLICATE_TYPE_PARAMETER:\n"
+        ++ " Duplicate type parameter: "
+        ++ printTree name
 
 type TypeCheckerResult t = Either TypeCheckerError t
 
@@ -419,6 +424,12 @@ extractFunctionSignature decl = Left $ UnsupportedDecl decl
 collectFuncDecls :: [Decl] -> TypeCheckerResult [FunctionSignature]
 collectFuncDecls decls = sequence $ extractFunctionSignature <$> decls
 
+noDublicatesTypeVars :: [StellaIdent] -> TypeCheckerResult ()
+noDublicatesTypeVars vars =
+  case duplicateIn vars of
+    Just duplicated -> Left $ DuplicateTypeParameter duplicated
+    Nothing -> return ()
+
 typeCheckFunction :: Context -> Decl -> TypeCheckerResult ()
 typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
   let types = ctxTypeNames ctx
@@ -431,6 +442,7 @@ typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nest
   let bodyContext = nestedFunctionCtx `ctxExtend` extendedCtx
   validate'n'ensure'ctx bodyContext body ret
 typeCheckFunction ctx (DeclFunGeneric _ name templates params (SomeReturnType return_type) _ nested body) = do
+  noDublicatesTypeVars templates
   let ctx' = (CtxType <$> reverse templates) ++ ctx
   let types = ctxTypeNames ctx'
   ctxExtension <- paramsToContext params
@@ -811,7 +823,7 @@ ensureNoRecordDuplicateFileds bindings =
 -- Reuses existsing `Type` for De Bruijn form
 -- In De Bruijn form variable name is its De Bruijn index as string.
 ident2index :: StellaIdent -> Int
-ident2index (StellaIdent s) = traceStack ("ident2index called with: " ++ s) $ read s
+ident2index (StellaIdent s) = read s
 
 index2ident :: Int -> StellaIdent
 index2ident = StellaIdent . show
@@ -881,7 +893,7 @@ deBruijnSubst v s _ = error "System F internal error" -- Other types are non-mat
 deBruijnSubstForall :: Type -> [Type] -> TypeCheckerResult Type
 deBruijnSubstForall t@(TypeForAll indents inner) substs
   | length indents /= length substs = Left $ IncorrectNumberOfTypeArguments t substs
-  | otherwise = Right $ deBruijnShift (- length substs) $ substMany inner (reverse substs)
+  | otherwise = Right $ deBruijnShift (- length substs) $ substMany inner (reverse $ map (deBruijnShift $ length indents) substs)
   where
     substMany :: Type -> [Type] -> Type
     substMany body vals = foldl (flip $ uncurry deBruijnSubst) body $ zip [0 ..] vals
@@ -901,7 +913,6 @@ infer ctx (Abstraction params body) = do
   paramsToContext params
   sequence_ $ validateType <$> [t | (AParamDecl _ t) <- params]
   paramsDecls <- sequence $ [(name,) <$> nominal2deBruijn (ctxTypeNames ctx) t | (AParamDecl name t) <- params]
-  -- traceM $ show paramsDecls
   return_type <- infer (paramsDecls `ctxExtend` ctx) body
   return $ TypeFun (snd <$> paramsDecls) return_type
 infer ctx e@(Application callee args) = do
@@ -1025,6 +1036,7 @@ infer ctx e@(Fix f) = do
     (TypeFun args _) -> Left $ MismatchedArgumentsNumber 1 (length args) e
     _ -> Left $ NotAFunction f
 infer ctx (TypeAbstraction vars body) = do
+  noDublicatesTypeVars vars
   let ctx' = ctxAddVars (reverse vars) ctx
   t <- infer ctx' body
   return $ TypeForAll vars t
@@ -1051,7 +1063,6 @@ ensure ctx (If c t e) expected = do
   ensure ctx e expected
 ensure ctx e@(Abstraction params body) (TypeFun expected_args return_type) = do
   paramsToContext params
-  -- traceM $ "ctx:" ++ show ctx
   actual_args <- sequence [nominal2deBruijn (ctxTypeNames ctx) t | (AParamDecl name t) <- params]
   if length expected_args /= length actual_args
     then Left $ UnexpectedArgumentsNumberInLambda (length expected_args) (length actual_args) e
@@ -1433,7 +1444,7 @@ reconstruction'infer ctx e@(Application callee args) = do
   calleeTy <- reconstruction'infer ctx callee
   case calleeTy of
     TypeFun paramTys retTy -> do
-      unless (length paramTys == length args) (liftTC $ Left $ MismatchedArgumentsNumber (length paramTys) (length args) e )
+      unless (length paramTys == length args) (liftTC $ Left $ MismatchedArgumentsNumber (length paramTys) (length args) e)
       sequence_ [reconstruction'ensure ctx a p | (p, a) <- zip paramTys args]
       return retTy
     _ -> do

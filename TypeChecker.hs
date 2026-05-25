@@ -13,7 +13,6 @@ import Data.Maybe (fromJust, isJust, isNothing, mapMaybe)
 import qualified Data.Set as S
 import Debug.Trace (trace, traceM)
 import GHC.IO (unsafePerformIO)
-import Language.Haskell.TH (Con)
 import Syntax.Abs
   ( Binding (ABinding),
     Decl (DeclFun, DeclFunGeneric),
@@ -1178,7 +1177,7 @@ freshVariable :: ReconstructionResult StellaIdent
 freshVariable = do
   st <- get
   put $ ReconstructionState (stEqs st) (1 + stFreshCounter st)
-  return $ StellaIdent $ "_FV_" ++ show (stFreshCounter st)
+  return $ StellaIdent $ "?T" ++ show (stFreshCounter st)
 
 unifyTypes :: Type -> Type -> ReconstructionResult ()
 unifyTypes l r = do

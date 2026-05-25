@@ -8,7 +8,8 @@ Type checker implementation is placed into `TypeChecker.hs` file
 ## Supported features
 
 `extend with` section is not checked, the tool considers all the following extensions are
-on all the time:
+on all the time (the ony exception is `#type-reconstruction`, which significantly
+influences the type-checking process):
 
 * Core language
 * Unit type
@@ -20,8 +21,10 @@ on all the time:
 * Lists
 * Variants
 * Fixpoint combinator
+* Church-style System F 
+* Type reconstructions (for limited suubset of programs), including
 
-Additionally, tool supports following extensions:
+Additionally, the tool supports following extensions:
 
 * Natural literals
 * Nullary & multiparameter functions
@@ -36,8 +39,9 @@ The requirements are:
 * GHC >= 8.10.7
 * alex >= 3.3.0
 * happy >= 1.20.1
+* mtl >= 2.3.1 **(New!)** 
 
-Building commands (or just run `build.sh`):
+Makefile is provided
 
 ```bash
 alex --ghc Lex.x 

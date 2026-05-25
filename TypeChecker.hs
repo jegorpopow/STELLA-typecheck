@@ -1,14 +1,17 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 
 module Syntax.TypeChecker where
 
-import Control.Monad (unless, when)
+import Control.Monad (forM, forM_, replicateM, unless, when)
+import Control.Monad.Except
+import Control.Monad.State
 import Data.Either (fromLeft, fromRight)
 import Data.IORef (IORef, newIORef)
 import Data.List (elemIndex, intercalate, nub, (\\))
-import Data.Maybe (fromJust, isNothing, mapMaybe)
+import Data.Maybe (fromJust, isJust, isNothing, mapMaybe)
 import qualified Data.Set as S
-import Debug.Trace (trace)
+import Debug.Trace (trace, traceM, traceStack)
 import GHC.IO (unsafePerformIO)
 import Language.Haskell.TH (Con)
 import Syntax.Abs
@@ -61,7 +64,8 @@ import Syntax.Abs
     ReturnType (SomeReturnType),
     StellaIdent (StellaIdent),
     Type
-      ( TypeBool,
+      ( TypeAuto,
+        TypeBool,
         TypeForAll,
         TypeFun,
         TypeList,
@@ -126,6 +130,10 @@ data TypeCheckerError
   | TupleIndexOutOfBounds Integer Type
   | WrongArityMain Int
   | NonexhaustivePatternMatching [Pattern] Expr Type
+  | NotAGenericFunction Expr Type
+  | IncorrectNumberOfTypeArguments Type [Type]
+  | UndefinedTypeVariable StellaIdent
+  | InfiniteType Type Type
   deriving (Eq, Ord, Read)
 
 instance Show TypeCheckerError where
@@ -302,6 +310,32 @@ instance Show TypeCheckerError where
         ++ printTree e
         ++ " of type "
         ++ printTree t
+    NotAGenericFunction e t ->
+      "ERROR_NOT_A_GENERIC_FUNCTION:\n"
+        ++ " Expression "
+        ++ printTree e
+        ++ " of type (de Bruijn indeces used) "
+        ++ printTree t
+        ++ " is not a generic function "
+    IncorrectNumberOfTypeArguments f args ->
+      "ERROR_INCORRECT_NUMBER_OF_TYPE_ARGUMENTS:\n"
+        ++ "  Expression of type (de Bruijn indeces used)"
+        ++ printTree f
+        ++ "  can not be apllied to "
+        ++ show (length args)
+        ++ "  type arguments"
+    UndefinedTypeVariable name ->
+      "ERROR_UNDEFINED_TYPE_VARIABLE:\n"
+        ++ "  Type variable "
+        ++ printTree name
+        ++ " is undefined"
+    InfiniteType a b ->
+      "ERROR_OCCURS_CHECK_INFINITE_TYPE:\n"
+        ++ "  Equation "
+        ++ printTree a
+        ++ "  equals"
+        ++ printTree b
+        ++ "  found"
 
 type TypeCheckerResult t = Either TypeCheckerError t
 
@@ -310,6 +344,19 @@ type Maplets = [(StellaIdent, Type)]
 data CtxElem
   = CtxMaplet (StellaIdent, Type)
   | CtxType StellaIdent
+  deriving (Show)
+
+extensionNames :: [Extension] -> [String]
+extensionNames ext_decls = [name | (AnExtension exts) <- ext_decls, (ExtensionName name) <- exts]
+
+-- entry point --
+runChecker :: Program -> TypeCheckerResult ()
+runChecker program@(AProgram _ extensions decls) = do
+  let exNames = extensionNames extensions
+  let recontructionNeeded = "#type-reconstruction" `elem` exNames
+  if recontructionNeeded
+    then runReconstruction $ reconstructProgram program
+    else typeCheck program
 
 type Context = [CtxElem]
 
@@ -347,6 +394,16 @@ ctxLookup ctx name = go ctx name 0
       | name' == name = Just $ deBruijnShift n t
       | otherwise = go rest name n
 
+-- no De Bruijn shift
+ctxLookupRaw :: Context -> StellaIdent -> Maybe Type
+ctxLookupRaw ctx name = go ctx
+  where
+    go [] = Nothing
+    go (CtxMaplet (n, t) : rest)
+      | n == name = Just t
+      | otherwise = go rest
+    go (CtxType _ : rest) = go rest
+
 ctxTypeNames :: Context -> [StellaIdent]
 ctxTypeNames ctx = [name | CtxType name <- ctx]
 
@@ -362,25 +419,24 @@ extractFunctionSignature decl = Left $ UnsupportedDecl decl
 collectFuncDecls :: [Decl] -> TypeCheckerResult [FunctionSignature]
 collectFuncDecls decls = sequence $ extractFunctionSignature <$> decls
 
-{-# NOINLINE freshVarCounter #-}
-freshVarCounter :: IORef Int
-freshVarCounter = unsafePerformIO (newIORef 0)
-
 typeCheckFunction :: Context -> Decl -> TypeCheckerResult ()
 typeCheckFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
+  let types = ctxTypeNames ctx
   ctxExtension <- paramsToContext params
+  ctxExtension <- sequence [(n,) <$> nominal2deBruijn types t | (n, t) <- ctxExtension]
+  ret <- nominal2deBruijn types return_type
   let extendedCtx = ctxExtension `ctxExtend` ctx
   typecheckFunctions extendedCtx nested
   nestedFunctionCtx <- collectFuncDecls nested
   let bodyContext = nestedFunctionCtx `ctxExtend` extendedCtx
-  validate'n'ensure'ctx bodyContext body return_type
+  validate'n'ensure'ctx bodyContext body ret
 typeCheckFunction ctx (DeclFunGeneric _ name templates params (SomeReturnType return_type) _ nested body) = do
   let ctx' = (CtxType <$> reverse templates) ++ ctx
   let types = ctxTypeNames ctx'
   ctxExtension <- paramsToContext params
   ctxExtension <- sequence [(n,) <$> nominal2deBruijn types t | (n, t) <- ctxExtension]
   ret <- nominal2deBruijn types return_type
-  let extendedCtx = ctxExtension `ctxExtend` ctx
+  let extendedCtx = ctxExtension `ctxExtend` ctx'
   typecheckFunctions extendedCtx nested
   nestedFunctionCtx <- collectFuncDecls nested
   bodyContextExtension <- sequence [(n,) <$> nominal2deBruijn types t | (n, t) <- nestedFunctionCtx]
@@ -408,10 +464,6 @@ data TCCfg = Cfg
     cfgSubTypes :: Bool
   }
 
-extensionNames :: [Extension] -> [String]
-extensionNames ext_decls = [name | (AnExtension exts) <- ext_decls, (ExtensionName name) <- exts]
-
--- Entry point of type checker: checks the whole program
 typeCheck :: Program -> TypeCheckerResult ()
 typeCheck program@(AProgram _ extensions decls) = do
   let cfg = let names = extensionNames extensions in Cfg ("ambiguous-type-as-bottom" `elem` names) ("structural-subtyping" `elem` names)
@@ -601,7 +653,9 @@ listConstructors t@(TypeVariant members) = [Constructor t (getRawIdent name) (op
     optionalTypingToArr (SomeTyping t) = [t]
     optionalTypingToArr NoTyping = []
 listConstructors t@(TypeTuple fields) = [Constructor t "tuple" fields]
-listConstructors t@(TypeRecord fields) = [Constructor t "tuple" [t | (ARecordFieldType _ t) <- fields]]
+listConstructors t@(TypeRecord fields) = [Constructor t "record" [t | (ARecordFieldType _ t) <- fields]]
+listConstructors t@(TypeForAll _ _) = [Constructor t "<non-coverable forall>" []]
+listConstructors t@(TypeVar _) = [Constructor t "<non-coverable var>" []]
 listConstructors _ = error "Exhaustiveness check internal error" -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
 
 -- Evaluates which constructor of known type is covered with known pattern. Nothing stands for all the constructors
@@ -757,7 +811,7 @@ ensureNoRecordDuplicateFileds bindings =
 -- Reuses existsing `Type` for De Bruijn form
 -- In De Bruijn form variable name is its De Bruijn index as string.
 ident2index :: StellaIdent -> Int
-ident2index (StellaIdent s) = read s
+ident2index (StellaIdent s) = traceStack ("ident2index called with: " ++ s) $ read s
 
 index2ident :: Int -> StellaIdent
 index2ident = StellaIdent . show
@@ -775,10 +829,11 @@ nominal2deBruijn c (TypeVariant members) = TypeVariant <$> sequence [AVariantFie
 nominal2deBruijn c (TypeTuple fields) = TypeTuple <$> sequence [nominal2deBruijn c f | f <- fields]
 nominal2deBruijn c (TypeRecord fields) = TypeRecord <$> sequence [ARecordFieldType name <$> nominal2deBruijn c t | (ARecordFieldType name t) <- fields]
 nominal2deBruijn c (TypeVar name) = case elemIndex name c of
-  Nothing -> Left undefined
+  Nothing -> Left $ UndefinedTypeVariable name
   Just i -> return $ TypeVar $ index2ident i
 nominal2deBruijn c (TypeForAll idents inner) = TypeForAll idents <$> nominal2deBruijn (reverse idents ++ c) inner
-nominal2deBruijn c _ = error "System F internal" -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
+nominal2deBruijn c (TypeFun args ret) = TypeFun <$> sequence (nominal2deBruijn c <$> args) <*> nominal2deBruijn c ret
+nominal2deBruijn c t = error $ "System F internal: " ++ printTree t -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
 
 deBruijnBoundedShift :: Int -> Int -> Type -> Type
 deBruijnBoundedShift _ _ TypeUnit = TypeUnit
@@ -792,6 +847,7 @@ deBruijnBoundedShift v b (TypeVariant members) = TypeVariant [AVariantFieldType 
     go NoTyping = NoTyping
 deBruijnBoundedShift v b (TypeTuple fields) = TypeTuple $ [deBruijnBoundedShift v b f | f <- fields]
 deBruijnBoundedShift v b (TypeRecord fields) = TypeRecord $ [ARecordFieldType name (deBruijnBoundedShift v b t) | (ARecordFieldType name t) <- fields]
+deBruijnBoundedShift v b (TypeFun args ret) = TypeFun (deBruijnBoundedShift v b <$> args) $ deBruijnBoundedShift v b ret
 deBruijnBoundedShift v b t@(TypeVar name)
   | ident2index name < b = t
   | otherwise = TypeVar $ index2ident $ ident2index name + v
@@ -814,6 +870,7 @@ deBruijnSubst v s (TypeVariant members) = TypeVariant [AVariantFieldType name (g
     go NoTyping = NoTyping
 deBruijnSubst v s (TypeTuple fields) = TypeTuple $ [deBruijnSubst v s f | f <- fields]
 deBruijnSubst v s (TypeRecord fields) = TypeRecord $ [ARecordFieldType name (deBruijnSubst v s t) | (ARecordFieldType name t) <- fields]
+deBruijnSubst v s (TypeFun args ret) = TypeFun (deBruijnSubst v s <$> args) $ deBruijnSubst v s ret
 deBruijnSubst v s t@(TypeVar name)
   | ident2index name == v = s
   | otherwise = t
@@ -822,8 +879,8 @@ deBruijnSubst v s (TypeForAll idents inner) =
 deBruijnSubst v s _ = error "System F internal error" -- Other types are non-matchable. Should be checked via patternContext prior to exhaustiveness check
 
 deBruijnSubstForall :: Type -> [Type] -> TypeCheckerResult Type
-deBruijnSubstForall (TypeForAll indents inner) substs
-  | length indents /= length substs = Left undefined
+deBruijnSubstForall t@(TypeForAll indents inner) substs
+  | length indents /= length substs = Left $ IncorrectNumberOfTypeArguments t substs
   | otherwise = Right $ deBruijnShift (- length substs) $ substMany inner (reverse substs)
   where
     substMany :: Type -> [Type] -> Type
@@ -841,10 +898,12 @@ infer ctx (If c t e) = do
   ensure ctx e lhs
   return lhs
 infer ctx (Abstraction params body) = do
-  _ <- paramsToContext params
+  paramsToContext params
   sequence_ $ validateType <$> [t | (AParamDecl _ t) <- params]
-  return_type <- infer ([(name, t) | (AParamDecl name t) <- params] `ctxExtend` ctx) body
-  return $ TypeFun [t | (AParamDecl name t) <- params] return_type
+  paramsDecls <- sequence $ [(name,) <$> nominal2deBruijn (ctxTypeNames ctx) t | (AParamDecl name t) <- params]
+  -- traceM $ show paramsDecls
+  return_type <- infer (paramsDecls `ctxExtend` ctx) body
+  return $ TypeFun (snd <$> paramsDecls) return_type
 infer ctx e@(Application callee args) = do
   callee_type <- infer ctx callee
   case callee_type of
@@ -975,7 +1034,7 @@ infer ctx (TypeApplication f args) = do
     (TypeForAll idents _) -> do
       args <- sequence $ nominal2deBruijn (ctxTypeNames ctx) <$> args
       deBruijnSubstForall t args
-    _ -> Left undefined
+    _ -> Left $ NotAGenericFunction f t
 infer _ e = Left $ UnsupportedExpression e
 
 -- verification function: ensures that expression can be typed with the specific type
@@ -991,13 +1050,15 @@ ensure ctx (If c t e) expected = do
   ensure ctx t expected
   ensure ctx e expected
 ensure ctx e@(Abstraction params body) (TypeFun expected_args return_type) = do
-  _ <- paramsToContext params
-  let actual_args = [t | (AParamDecl name t) <- params]
+  paramsToContext params
+  -- traceM $ "ctx:" ++ show ctx
+  actual_args <- sequence [nominal2deBruijn (ctxTypeNames ctx) t | (AParamDecl name t) <- params]
   if length expected_args /= length actual_args
     then Left $ UnexpectedArgumentsNumberInLambda (length expected_args) (length actual_args) e
     else
       if actual_args == expected_args
-        then ensure ([(name, t) | (AParamDecl name t) <- params] `ctxExtend` ctx) body return_type
+        then do
+          ensure ([(name, t) | (AParamDecl name t) <- params] `ctxExtend` ctx) body return_type
         else
           Left $
             UnexpectedTypeForParameter
@@ -1090,3 +1151,484 @@ validate'n'ensure'ctx :: Context -> Expr -> Type -> TypeCheckerResult ()
 validate'n'ensure'ctx ctx e t = do
   sequence_ $ validateType . snd <$> [t | CtxMaplet t <- ctx]
   validate'n'ensure ctx e t
+
+------ Type Reconstrustion utils ------
+
+type Substitution = [(StellaIdent, Type)]
+
+data ReconstructionState = ReconstructionState
+  { stEqs :: [(Type, Type)], -- collected equations
+    stFreshCounter :: Int -- fresh variable counter
+  }
+
+type ReconstructionResult a = ExceptT TypeCheckerError (State ReconstructionState) a
+
+freshVariable :: ReconstructionResult StellaIdent
+freshVariable = do
+  st <- get
+  put $ ReconstructionState (stEqs st) (1 + stFreshCounter st)
+  return $ StellaIdent $ "_FV_" ++ show (stFreshCounter st)
+
+unifyTypes :: Type -> Type -> ReconstructionResult ()
+unifyTypes l r = do
+  st <- get
+  put $ ReconstructionState ((l, r) : stEqs st) (stFreshCounter st)
+
+-- Wraps computation, which do not produce new equations or fresh vars
+liftTC :: TypeCheckerResult a -> ReconstructionResult a
+liftTC = ExceptT . return
+
+runReconstruction :: ReconstructionResult a -> TypeCheckerResult a
+runReconstruction m = evalState (runExceptT m) (ReconstructionState [] 0)
+
+freeVars :: Type -> [StellaIdent]
+freeVars TypeBool = []
+freeVars TypeNat = []
+freeVars TypeUnit = []
+freeVars (TypeVar x) = [x]
+freeVars (TypeFun args ret) = concatMap freeVars args ++ freeVars ret
+freeVars (TypeSum l r) = freeVars l ++ freeVars r
+freeVars (TypeTuple ts) = concatMap freeVars ts
+freeVars (TypeList t) = freeVars t
+freeVars (TypeRecord fs) = concatMap (\(ARecordFieldType _ t) -> freeVars t) fs
+freeVars (TypeVariant vs) =
+  concatMap
+    ( \(AVariantFieldType _ ot) ->
+        case ot of SomeTyping t -> freeVars t; NoTyping -> []
+    )
+    vs
+freeVars _ = []
+
+applySubst :: Substitution -> Type -> Type
+applySubst subst = go
+  where
+    go (TypeVar x) = case lookup x subst of
+      Just t -> go t
+      Nothing -> TypeVar x
+    go (TypeFun args ret) = TypeFun (map go args) (go ret)
+    go (TypeSum l r) = TypeSum (go l) (go r)
+    go (TypeTuple ts) = TypeTuple (map go ts)
+    go (TypeList t) = TypeList (go t)
+    go (TypeRecord fs) = TypeRecord [ARecordFieldType n (go t) | ARecordFieldType n t <- fs]
+    go (TypeVariant vs) = TypeVariant [AVariantFieldType n (goOpt ot) | AVariantFieldType n ot <- vs]
+      where
+        goOpt NoTyping = NoTyping
+        goOpt (SomeTyping t) = SomeTyping (go t)
+    go t = t
+
+composeSubst :: Substitution -> Substitution -> Substitution
+composeSubst s1 s2 = [(x, applySubst s1 t) | (x, t) <- s2] ++ s1
+
+-- Unify a set of equations, producing a substitution
+unify :: [(Type, Type)] -> TypeCheckerResult Substitution
+unify [] = Right []
+unify ((s, t) : rest)
+  | s == t = unify rest
+  | otherwise = case (s, t) of
+    (TypeVar x, _)
+      | x `notElem` freeVars t ->
+        let subst1 = [(x, t)]
+            rest' = [(applySubst subst1 a, applySubst subst1 b) | (a, b) <- rest]
+         in composeSubst subst1 <$> unify rest'
+      | otherwise -> Left $ InfiniteType s t -- occurs check fails
+    (_, TypeVar x)
+      | x `notElem` freeVars s ->
+        let subst1 = [(x, s)]
+            rest' = [(applySubst subst1 a, applySubst subst1 b) | (a, b) <- rest]
+         in composeSubst subst1 <$> unify rest'
+      | otherwise -> Left $ InfiniteType s t
+    (TypeFun args1 ret1, TypeFun args2 ret2)
+      | length args1 == length args2 ->
+        unify (zip args1 args2 ++ [(ret1, ret2)] ++ rest)
+      | otherwise -> Left $ UnexpectedType dummy (TypeFun args1 ret1) (TypeFun args2 ret2)
+    (TypeSum l1 r1, TypeSum l2 r2) ->
+      unify ([(l1, l2), (r1, r2)] ++ rest)
+    (TypeTuple ts1, TypeTuple ts2)
+      | length ts1 == length ts2 ->
+        unify (zip ts1 ts2 ++ rest)
+      | otherwise -> Left $ UnexpectedType dummy (TypeTuple ts1) (TypeTuple ts2)
+    (TypeList t1, TypeList t2) ->
+      unify ((t1, t2) : rest)
+    (TypeRecord fs1, TypeRecord fs2) ->
+      let names1 = [n | ARecordFieldType n _ <- fs1]
+          names2 = [n | ARecordFieldType n _ <- fs2]
+       in if names1 == names2
+            then
+              let eqs =
+                    [ (t1, t2) | ARecordFieldType n1 t1 <- fs1, ARecordFieldType n2 t2 <- fs2, n1 == n2
+                    ]
+               in unify (eqs ++ rest)
+            else Left $ UnexpectedType dummy (TypeRecord fs1) (TypeRecord fs2)
+    (TypeVariant vs1, TypeVariant vs2) ->
+      let names1 = [n | AVariantFieldType n _ <- vs1]
+          names2 = [n | AVariantFieldType n _ <- vs2]
+       in if names1 == names2
+            then
+              let eqs =
+                    [ (t1, t2) | AVariantFieldType n1 (SomeTyping t1) <- vs1, AVariantFieldType n2 (SomeTyping t2) <- vs2, n1 == n2
+                    ]
+               in unify (eqs ++ rest)
+            else Left $ UnexpectedType dummy (TypeVariant vs1) (TypeVariant vs2)
+    _ -> Left $ UnexpectedType dummy s t
+  where
+    dummy = ConstTrue
+
+demangleAuto :: Type -> ReconstructionResult Type
+demangleAuto TypeAuto =
+  TypeVar <$> freshVariable
+demangleAuto (TypeFun args ret) =
+  TypeFun <$> mapM demangleAuto args <*> demangleAuto ret
+demangleAuto (TypeSum l r) =
+  TypeSum <$> demangleAuto l <*> demangleAuto r
+demangleAuto (TypeTuple ts) =
+  TypeTuple <$> mapM demangleAuto ts
+demangleAuto (TypeList t) =
+  TypeList <$> demangleAuto t
+demangleAuto (TypeRecord fs) =
+  TypeRecord <$> mapM demangleField fs
+  where
+    demangleField (ARecordFieldType n t) =
+      ARecordFieldType n <$> demangleAuto t
+demangleAuto (TypeVariant vs) =
+  TypeVariant <$> mapM demangleVariant vs
+  where
+    demangleVariant (AVariantFieldType n ot) =
+      AVariantFieldType n <$> demangleOpt ot
+    demangleOpt NoTyping = return NoTyping
+    demangleOpt (SomeTyping t) = SomeTyping <$> demangleAuto t
+demangleAuto t = return t
+
+demangleParamDecl :: ParamDecl -> ReconstructionResult ParamDecl
+demangleParamDecl (AParamDecl name t) = AParamDecl name <$> demangleAuto t
+
+demangleBinding :: PatternBinding -> ReconstructionResult PatternBinding
+demangleBinding (APatternBinding pat e) = APatternBinding pat <$> demangleExpr e
+
+demangleExpr :: Expr -> ReconstructionResult Expr
+demangleExpr (If e1 e2 e3) = If <$> demangleExpr e1 <*> demangleExpr e2 <*> demangleExpr e3
+demangleExpr (Let bindings body) =
+  Let <$> mapM demangleBinding bindings <*> demangleExpr body
+demangleExpr (LetRec bindings body) =
+  LetRec <$> mapM demangleBinding bindings <*> demangleExpr body
+demangleExpr (TypeAbstraction ids body) =
+  TypeAbstraction ids <$> demangleExpr body -- no types in parameters
+demangleExpr (TypeAsc e t) = TypeAsc <$> demangleExpr e <*> demangleAuto t
+demangleExpr (Abstraction params body) =
+  Abstraction <$> mapM demangleParamDecl params <*> demangleExpr body
+demangleExpr (Variant label ed) =
+  Variant label <$> demangleExprData ed
+  where
+    demangleExprData (SomeExprData e) = SomeExprData <$> demangleExpr e
+    demangleExprData NoExprData = return NoExprData
+demangleExpr (Match e cases) =
+  Match <$> demangleExpr e <*> mapM demangleMatchCase cases
+  where
+    demangleMatchCase :: MatchCase -> ReconstructionResult MatchCase
+    demangleMatchCase (AMatchCase pat e) = AMatchCase pat <$> demangleExpr e
+demangleExpr (List es) = List <$> mapM demangleExpr es
+demangleExpr (Application e es) = Application <$> demangleExpr e <*> mapM demangleExpr es
+demangleExpr (TypeApplication e ts) = TypeApplication <$> demangleExpr e <*> mapM demangleAuto ts
+demangleExpr (DotRecord e name) = DotRecord <$> demangleExpr e <*> pure name
+demangleExpr (DotTuple e i) = DotTuple <$> demangleExpr e <*> pure i
+demangleExpr (Tuple es) = Tuple <$> mapM demangleExpr es
+demangleExpr (Record bindings) = Record <$> mapM demangleBindingExpr bindings
+  where
+    demangleBindingExpr :: Binding -> ReconstructionResult Binding
+    demangleBindingExpr (ABinding name e) = ABinding name <$> demangleExpr e
+demangleExpr (ConsList e1 e2) = ConsList <$> demangleExpr e1 <*> demangleExpr e2
+demangleExpr (Head e) = Head <$> demangleExpr e
+demangleExpr (IsEmpty e) = IsEmpty <$> demangleExpr e
+demangleExpr (Tail e) = Tail <$> demangleExpr e
+demangleExpr (Inl e) = Inl <$> demangleExpr e
+demangleExpr (Inr e) = Inr <$> demangleExpr e
+demangleExpr (Succ e) = Succ <$> demangleExpr e
+demangleExpr (IsZero e) = IsZero <$> demangleExpr e
+demangleExpr (Fix e) = Fix <$> demangleExpr e
+demangleExpr (NatRec n init step) = NatRec <$> demangleExpr n <*> demangleExpr init <*> demangleExpr step
+demangleExpr e@ConstTrue = return e
+demangleExpr e@ConstFalse = return e
+demangleExpr e@ConstUnit = return e
+demangleExpr e@(ConstInt _) = return e
+demangleExpr e@(Var _) = return e
+demangleExpr _ = error "Unsupported Expr"
+
+demangleDecl :: Decl -> ReconstructionResult Decl
+demangleDecl (DeclFun ann name params (SomeReturnType ret) throwType decls body) = do
+  params' <- mapM demangleParamDecl params
+  ret' <- demangleAuto ret
+  decls' <- mapM demangleDecl decls
+  body' <- demangleExpr body
+  return $ DeclFun ann name params' (SomeReturnType ret') throwType decls' body'
+demangleDecl d = liftTC $ Left $ UnsupportedDecl d
+
+reconstructProgram :: Program -> ReconstructionResult ()
+reconstructProgram program@(AProgram _ extensions decls) = do
+  decls <- sequence $ demangleDecl <$> decls
+  liftTC $ collectFuncDecls decls >>= ensureMainValid
+  reconstructFunctions ctxEmpty decls
+  st <- get
+  liftTC $ unify (stEqs st)
+  return ()
+  where
+    ensureMainValid :: [FunctionSignature] -> TypeCheckerResult ()
+    ensureMainValid decls =
+      case lookup (StellaIdent "main") decls of
+        Nothing -> Left NoMain
+        Just (TypeFun [_] _) -> Right ()
+        Just (TypeFun args _) -> Left $ WrongArityMain $ length args
+        Just _ -> Left NoMain
+
+reconstructFunction :: Context -> Decl -> ReconstructionResult ()
+reconstructFunction ctx (DeclFun _ name params (SomeReturnType return_type) _ nested body) = do
+  ctxExtension <- liftTC $ paramsToContext params
+  let extendedCtx = ctxExtension `ctxExtend` ctx
+  reconstructFunctions extendedCtx nested
+  nestedFunctionCtx <- liftTC $ collectFuncDecls nested
+  let bodyContext = nestedFunctionCtx `ctxExtend` extendedCtx
+  validate'n'reconstruct'ctx bodyContext body return_type
+  where
+    validate'n'reconstruct :: Context -> Expr -> Type -> ReconstructionResult ()
+    validate'n'reconstruct ctx e t = do
+      t' <- liftTC $ validateType t
+      reconstruction'ensure ctx e t'
+    validate'n'reconstruct'ctx :: Context -> Expr -> Type -> ReconstructionResult ()
+    validate'n'reconstruct'ctx ctx e t = do
+      liftTC $ sequence_ $ validateType . snd <$> [t | CtxMaplet t <- ctx]
+      validate'n'reconstruct ctx e t
+reconstructFunction _ decl = liftTC $ Left $ UnsupportedDecl decl
+
+reconstructFunctions :: Context -> [Decl] -> ReconstructionResult ()
+reconstructFunctions ctx decls = do
+  signatures <- liftTC $ collectFuncDecls decls
+  functionsCtx <- liftTC $ ensureNoDuplicates signatures
+  let extendedCtx = functionsCtx `ctxExtend` ctx
+  sequence_ $ reconstructFunction extendedCtx <$> decls
+  where
+    ensureNoDuplicates :: [FunctionSignature] -> TypeCheckerResult Maplets
+    ensureNoDuplicates signatures =
+      case duplicateIn [name | (name, _) <- signatures] of
+        Nothing -> Right signatures
+        Just duplicated -> Left $ DuplicateFunctionDeclaration duplicated
+
+reconstruction'infer :: Context -> Expr -> ReconstructionResult Type
+reconstruction'infer _ ConstTrue = return TypeBool
+reconstruction'infer _ ConstFalse = return TypeBool
+reconstruction'infer _ (ConstInt _) = return TypeNat
+reconstruction'infer _ ConstUnit = return TypeUnit
+reconstruction'infer ctx (Var name) =
+  case ctx `ctxLookupRaw` name of
+    Nothing -> throwError $ UndefinedVariable name
+    Just t -> return t
+reconstruction'infer ctx (If c t e) = do
+  reconstruction'ensure ctx c TypeBool
+  t1 <- reconstruction'infer ctx t
+  t2 <- reconstruction'infer ctx e
+  unifyTypes t2 t1 -- t2 is actual type of second branch, t1- expected type of second branch
+  return t1
+reconstruction'infer ctx (Abstraction params body) = do
+  paramDecls <- liftTC $ paramsToContext params
+  bodyTy <- reconstruction'infer (paramDecls `ctxExtend` ctx) body
+  return $ TypeFun (snd <$> paramDecls) bodyTy
+reconstruction'infer ctx e@(Application callee args) = do
+  calleeTy <- reconstruction'infer ctx callee
+  case calleeTy of
+    TypeFun paramTys retTy -> do
+      unless (length paramTys == length args) (liftTC $ Left $ MismatchedArgumentsNumber (length paramTys) (length args) e )
+      sequence_ [reconstruction'ensure ctx a p | (p, a) <- zip paramTys args]
+      return retTy
+    _ -> do
+      argTys <- sequence [reconstruction'infer ctx arg | arg <- args]
+      retTy <- TypeVar <$> freshVariable
+      unifyTypes calleeTy (TypeFun argTys retTy)
+      return retTy
+reconstruction'infer ctx (Inl e) = do
+  t <- reconstruction'infer ctx e
+  r <- TypeVar <$> freshVariable
+  return $ TypeSum t r
+reconstruction'infer ctx (Inr e) = do
+  t <- reconstruction'infer ctx e
+  l <- TypeVar <$> freshVariable
+  return $ TypeSum l t
+reconstruction'infer ctx (Tuple elems) =
+  TypeTuple <$> sequence [reconstruction'infer ctx elem | elem <- elems]
+reconstruction'infer ctx (DotTuple tuple idx) = do
+  tupTy <- reconstruction'infer ctx tuple
+  let n = fromEnum idx
+  -- only `#pairs` supported
+  vars <- replicateM 2 (TypeVar <$> freshVariable)
+  unifyTypes tupTy (TypeTuple vars)
+  return $ vars !! (n - 1)
+reconstruction'infer ctx (Record bindings) = do
+  liftTC $ ensureNoRecordDuplicateFileds bindings
+  fields <- sequence [(name,) <$> reconstruction'infer ctx e | (ABinding name e) <- bindings]
+  let recTy = TypeRecord [ARecordFieldType name ty | (name, ty) <- fields]
+  liftTC $ validateType recTy
+  return recTy
+reconstruction'infer ctx (DotRecord record field) = do
+  recTy <- reconstruction'infer ctx record
+  -- All the record types are known from the literals
+  case recTy of
+    TypeRecord fields ->
+      case lookup field [(n, t) | ARecordFieldType n t <- fields] of
+        Just t -> return t
+        Nothing -> throwError $ UnexpectedRecordField recTy field
+    _ -> throwError $ NotARecord record
+reconstruction'infer ctx (Let bindings body) = do
+  let boundNames = concatMap namesInPattern [pat | APatternBinding pat _ <- bindings]
+  when (isJust (duplicateIn boundNames)) $
+    throwError $ DuplicateVariableLet (fromJust $ duplicateIn boundNames)
+  ctxs <- sequence [patternBindingCtxReconstr ctx binding | binding <- bindings]
+  patCtx <- liftTC $ joinPatternContexts ctxs
+  reconstruction'infer (patCtx `ctxJoin` ctx) body
+  where
+    patternBindingCtxReconstr ctx (APatternBinding pat e) = do
+      t <- reconstruction'infer ctx e
+      liftTC $ patternContext pat t
+reconstruction'infer ctx (LetRec [APatternBinding (PatternAsc pattern t) expr] body) = do
+  let boundNames = namesInPattern pattern
+  when (isJust (duplicateIn boundNames)) $
+    throwError $ DuplicateVariableLet (fromJust $ duplicateIn boundNames)
+  ctx' <- liftTC $ patternContext pattern t
+  unless (isIrrefutable t pattern) $
+    throwError $ NonexhaustivePatternMatching [pattern] expr t
+  let extendedCtx = ctx' `ctxJoin` ctx
+  reconstruction'ensure extendedCtx expr t
+  reconstruction'infer extendedCtx body
+reconstruction'infer ctx (LetRec [APatternBinding pattern expr] body) =
+  throwError $ AmbigousPatternType pattern
+reconstruction'infer _ (LetRec _ _) =
+  throwError $ UnsupportedConstruction "letrec with many bindings"
+reconstruction'infer ctx (TypeAsc e t) = do
+  liftTC $ validateType t
+  reconstruction'ensure ctx e t
+  return t
+--Dead code:
+reconstruction'infer _ (Variant _ (SomeExprData _)) = throwError AmbigousVariantType
+reconstruction'infer _ (Variant _ NoExprData) = throwError AmbigousVariantType
+reconstruction'infer ctx (Match e cases) = do
+  scrutTy <- reconstruction'infer ctx e
+  let patterns = [pat | AMatchCase pat _ <- cases]
+      hasSum =
+        any
+          ( \case
+              PatternInl _ -> True
+              PatternInr _ -> True
+              _ -> False
+          )
+          patterns
+
+  effScrutTy <-
+    if hasSum
+      then do
+        a <- TypeVar <$> freshVariable
+        b <- TypeVar <$> freshVariable
+        let sumTy = TypeSum a b
+        unifyTypes scrutTy sumTy
+        return sumTy
+      else return scrutTy
+  when hasSum $
+    unless (isExhaustive effScrutTy patterns) $
+      throwError $ NonexhaustivePatternMatching patterns e effScrutTy
+
+  branchTys <- forM cases $ \(AMatchCase pat body) -> do
+    ctx' <- liftTC $ patternContext pat effScrutTy
+    reconstruction'infer (ctx' `ctxJoin` ctx) body
+
+  resTy <- TypeVar <$> freshVariable
+  mapM_ (unifyTypes resTy) branchTys
+  return resTy
+reconstruction'infer _ (List []) = do
+  x <- TypeVar <$> freshVariable
+  return $ TypeList x
+reconstruction'infer ctx (List (h : t)) = do
+  headTy <- reconstruction'infer ctx h
+  mapM_ (\e -> reconstruction'ensure ctx e headTy) t
+  return $ TypeList headTy
+reconstruction'infer ctx (ConsList h t) = do
+  hTy <- reconstruction'infer ctx h
+  reconstruction'ensure ctx t (TypeList hTy)
+  return $ TypeList hTy
+reconstruction'infer ctx (Head list) = do
+  lTy <- reconstruction'infer ctx list
+  x <- TypeVar <$> freshVariable
+  unifyTypes lTy (TypeList x)
+  return x
+reconstruction'infer ctx (Tail list) = do
+  lTy <- reconstruction'infer ctx list
+  x <- TypeVar <$> freshVariable
+  unifyTypes lTy (TypeList x)
+  return lTy -- Tail returns the whole list type
+reconstruction'infer ctx (IsEmpty list) = do
+  lTy <- reconstruction'infer ctx list
+  x <- TypeVar <$> freshVariable
+  unifyTypes lTy (TypeList x)
+  return TypeBool
+reconstruction'infer ctx (Fix f) = do
+  fTy <- reconstruction'infer ctx f
+  x <- TypeVar <$> freshVariable
+  unifyTypes fTy (TypeFun [x] x)
+  return x
+reconstruction'infer ctx (Succ e) = do
+  reconstruction'ensure ctx e TypeNat
+  return TypeNat
+reconstruction'infer ctx (IsZero e) = do
+  reconstruction'ensure ctx e TypeNat
+  return TypeBool
+reconstruction'infer ctx (NatRec n init step) = do
+  reconstruction'ensure ctx n TypeNat
+  t <- reconstruction'infer ctx init
+  reconstruction'ensure ctx step (TypeFun [TypeNat] (TypeFun [t] t))
+  return t
+reconstruction'infer _ e = throwError $ UnsupportedExpression e
+
+reconstruction'ensure :: Context -> Expr -> Type -> ReconstructionResult ()
+-- reconstruction'ensure ctx e@(Record bindings) expected = do
+--   liftTC $ ensureNoRecordDuplicateFileds bindings
+--   fields <- mapM (\(ABinding name expr) -> (name,) <$> reconstruction'infer ctx expr) bindings
+--   let actualRec = TypeRecord [ARecordFieldType name ty | (name, ty) <- fields]
+--   unifyTypes actualRec expected
+--   actual <- reconstruction'infer ctx e
+--   unifyTypes actual expected
+-- reconstruction'ensure ctx e@(LetRec [APatternBinding (PatternAsc pat t) expr] body) expected = do
+--   ctx' <- liftTC $ patternContext pat t
+--   unless (isIrrefutable t pat) $
+--     throwError $ NonexhaustivePatternMatching [pat] expr t
+--   let extendedCtx = ctx' `ctxJoin` ctx
+--   reconstruction'ensure extendedCtx expr t
+--   reconstruction'ensure extendedCtx body expected
+--   actual <- reconstruction'infer ctx e
+--   unifyTypes actual expected
+-- reconstruction'ensure ctx (Match e cases) expected = do
+--   scrutTy <- reconstruction'infer ctx e
+--   let patterns = [pat | AMatchCase pat _ <- cases]
+--       hasSum =
+--         any
+--           ( \case
+--               PatternInl _ -> True
+--               PatternInr _ -> True
+--               _ -> False
+--           )
+--           patterns
+
+--   effScrutTy <-
+--     if hasSum
+--       then do
+--         a <- TypeVar <$> freshVariable
+--         b <- TypeVar <$> freshVariable
+--         let sumTy = TypeSum a b
+--         unifyTypes scrutTy sumTy
+--         return sumTy
+--       else return scrutTy
+--   when hasSum $
+--     unless (isExhaustive effScrutTy patterns) $
+--       throwError $ NonexhaustivePatternMatching patterns e effScrutTy
+
+--   sequence_
+--     [ do
+--         ctx' <- liftTC $ patternContext pat effScrutTy
+--         reconstruction'ensure (ctx' `ctxJoin` ctx) body expected
+--       | (AMatchCase pat body) <- cases
+--     ]
+reconstruction'ensure ctx e expected = do
+  actual <- reconstruction'infer ctx e
+  unifyTypes actual expected

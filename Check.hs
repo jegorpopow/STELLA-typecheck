@@ -8,7 +8,7 @@ import Syntax.Abs (Program)
 import Syntax.Lex (Token, mkPosToken)
 import Syntax.Par (myLexer, pProgram)
 import Syntax.Print (Print, printTree)
-import Syntax.TypeChecker (typeCheck)
+import Syntax.TypeChecker (runChecker, typeCheck)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hPrint, hPutStrLn, print, stderr)
@@ -53,7 +53,7 @@ run v p s =
       hPutStrLn stderr "Parse Failed...\n"
       exitFailure
     Right tree ->
-      case typeCheck tree of
+      case runChecker tree of
         (Right ()) -> exitSuccess
         (Left err) -> do
           hPrint stderr err
